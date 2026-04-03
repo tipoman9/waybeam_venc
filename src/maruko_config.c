@@ -38,8 +38,7 @@ void maruko_config_defaults(MarukoBackendConfig *cfg)
 
 int maruko_config_from_venc(const VencConfig *vcfg, MarukoBackendConfig *cfg)
 {
-	char host[128];
-	uint16_t port;
+	VencOutputUri output_uri;
 
 	if (!vcfg || !cfg) {
 		return -1;
@@ -60,22 +59,23 @@ int maruko_config_from_venc(const VencConfig *vcfg, MarukoBackendConfig *cfg)
 	cfg->max_frame_size = vcfg->outgoing.max_payload_size;
 	cfg->rtp_payload_size = vcfg->outgoing.max_payload_size;
 	cfg->sidecar_port = vcfg->outgoing.sidecar_port;
+	cfg->output_uri_type = VENC_OUTPUT_URI_UDP;
 
 	if (vcfg->outgoing.server[0]) {
-		if (strncmp(vcfg->outgoing.server, "shm://", 6) == 0) {
-			if (!vcfg->outgoing.server[6]) {
-				fprintf(stderr, "ERROR: shm:// URI missing name\n");
-				return -1;
-			}
+		if (venc_config_parse_output_uri(vcfg->outgoing.server,
+		    &output_uri) != 0)
+			return -1;
+
+		cfg->output_uri_type = output_uri.type;
+		if (output_uri.type == VENC_OUTPUT_URI_SHM) {
 			snprintf(cfg->shm_name, sizeof(cfg->shm_name), "%s",
-				vcfg->outgoing.server + 6);
+				output_uri.endpoint);
+		} else if (output_uri.type == VENC_OUTPUT_URI_UNIX) {
+			snprintf(cfg->unix_socket_name, sizeof(cfg->unix_socket_name), "%s",
+				output_uri.endpoint);
 		} else {
-			if (venc_config_parse_server_uri(vcfg->outgoing.server,
-			    host, sizeof(host), &port) != 0) {
-				return -1;
-			}
-			cfg->udp_sink_ip = inet_addr(host);
-			cfg->udp_sink_port = port;
+			cfg->udp_sink_ip = inet_addr(output_uri.host);
+			cfg->udp_sink_port = output_uri.port;
 		}
 	}
 

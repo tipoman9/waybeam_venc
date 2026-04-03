@@ -15,7 +15,7 @@
   - `read_only` — cannot be changed via API.
 
 ## Contract Version
-- `contract_version`: `0.6.0`
+- `contract_version`: `0.6.1`
 - `status`: `active`
 
 ## Governance Rules
@@ -224,6 +224,30 @@ Response `200`:
 ```json
 {"ok":true,"data":{"field":"video0.bitrate","value":4096}}
 ```
+
+### `outgoing.server` URI schemes
+
+`outgoing.server` accepts these URI forms:
+
+- `udp://HOST:PORT` — standard UDP datagram output
+- `unix://NAME` — abstract Unix datagram socket `@NAME`
+- `shm://NAME` — shared-memory RTP ring buffer
+
+Notes:
+
+- `unix://` maps to Linux abstract Unix sockets, not filesystem socket paths.
+- `connectedUdp` applies only to `udp://` destinations.
+- `shm://` remains RTP-only.
+- Live `outgoing.server` updates remain UDP-only in the current implementation.
+- `unix://` is supported for configured output at startup/reinit, not for live destination switching through `apply_server()`.
+
+Examples:
+
+```bash
+curl "http://192.168.2.10/api/v1/set?outgoing.server=udp://192.168.2.20:5600"
+```
+
+When `unix://` is used with WFB-ng `tx.cpp`, the external transmitter must be started with the matching `-U NAME` endpoint so it binds the same abstract socket.
 
 **Restart-required fields** (`mutability: "restart_required"`) trigger an automatic
 pipeline reinit (sensor→VIF→VPE→VENC teardown and rebuild):

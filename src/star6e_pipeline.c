@@ -759,7 +759,7 @@ static int prepare_pipeline_config(Star6ePipelineState *state,
 		fprintf(stderr,
 			"ERROR: RTP mode on star6e currently supports H.265 only.\n");
 		fprintf(stderr,
-			"       Set video0.codec to h265 or outgoing.server to udp://.\n");
+			"       Set video0.codec to h265 or use compact mode / non-RTP output.\n");
 		return -1;
 	}
 

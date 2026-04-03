@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #define STAR6E_RTP_HEADER_SIZE 12
@@ -36,8 +37,9 @@ static void star6e_write_be32(uint8_t *data, uint32_t value)
 	data[3] = (uint8_t)(value & 0xff);
 }
 
-static int star6e_output_send_udp_parts(int socket_handle,
-	const struct sockaddr_in *dst, const uint8_t *header, size_t header_len,
+static int star6e_output_send_socket_parts(int socket_handle,
+	const struct sockaddr_storage *dst, socklen_t dst_len,
+	const uint8_t *header, size_t header_len,
 	const uint8_t *payload1, size_t payload1_len,
 	const uint8_t *payload2, size_t payload2_len)
 {
@@ -46,7 +48,7 @@ static int star6e_output_send_udp_parts(int socket_handle,
 	ssize_t sent;
 	int iovcnt;
 
-	if (socket_handle < 0 || !dst || !header || !payload1 ||
+	if (socket_handle < 0 || !dst || dst_len == 0 || !header || !payload1 ||
 	    header_len == 0 || payload1_len == 0) {
 		return -1;
 	}
@@ -64,7 +66,7 @@ static int star6e_output_send_udp_parts(int socket_handle,
 
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_name = (void *)dst;
-	msg.msg_namelen = sizeof(*dst);
+	msg.msg_namelen = dst_len;
 	msg.msg_iov = vec;
 	msg.msg_iovlen = iovcnt;
 	sent = sendmsg(socket_handle, &msg, 0);
@@ -76,8 +78,11 @@ static int star6e_audio_output_resolve_destination(
 {
 	if (!audio_output || !audio_output->video_output || !dst)
 		return -1;
+	if (audio_output->video_output->transport !=
+	    STAR6E_OUTPUT_TRANSPORT_UDP)
+		return -1;
 
-	*dst = audio_output->video_output->dst;
+	memcpy(dst, &audio_output->video_output->dst, sizeof(*dst));
 	if (audio_output->port_override != 0)
 		dst->sin_port = htons(audio_output->port_override);
 	return 0;
@@ -95,9 +100,101 @@ static int star6e_audio_output_write_rtp(const uint8_t *header,
 		return -1;
 	}
 
-	return star6e_output_send_udp_parts(audio_output->socket_handle, &dst,
+	return star6e_output_send_socket_parts(audio_output->socket_handle,
+		(const struct sockaddr_storage *)&dst, sizeof(dst),
 		header, header_len, payload1, payload1_len,
 		payload2, payload2_len);
+}
+
+static void star6e_output_store_udp_destination(Star6eOutput *output,
+	const char *host, uint16_t port)
+{
+	struct sockaddr_in *dst = (struct sockaddr_in *)&output->dst;
+
+	memset(&output->dst, 0, sizeof(output->dst));
+	dst->sin_family = AF_INET;
+	dst->sin_port = htons(port);
+	dst->sin_addr.s_addr = inet_addr(host);
+	output->dst_len = sizeof(*dst);
+}
+
+static int star6e_output_store_unix_destination(Star6eOutput *output,
+	const char *name)
+{
+	struct sockaddr_un *dst = (struct sockaddr_un *)&output->dst;
+	size_t name_len;
+
+	if (!name || !name[0])
+		return -1;
+
+	name_len = strlen(name);
+	if (name_len > sizeof(dst->sun_path) - 2) {
+		fprintf(stderr, "ERROR: unix:// socket name too long\n");
+		return -1;
+	}
+
+	memset(&output->dst, 0, sizeof(output->dst));
+	dst->sun_family = AF_UNIX;
+	memcpy(dst->sun_path + 1, name, name_len);
+	output->dst_len = (socklen_t)(sizeof(sa_family_t) + name_len + 1);
+	return 0;
+}
+
+static int star6e_output_open_socket(Star6eOutput *output,
+	Star6eOutputTransport transport)
+{
+	int domain;
+
+	if (!output)
+		return -1;
+
+	if (output->socket_handle >= 0) {
+		close(output->socket_handle);
+		output->socket_handle = -1;
+	}
+
+	domain = transport == STAR6E_OUTPUT_TRANSPORT_UNIX ? AF_UNIX : AF_INET;
+	output->socket_handle = socket(domain, SOCK_DGRAM, 0);
+	if (output->socket_handle < 0) {
+		fprintf(stderr, "ERROR: Unable to create %s socket\n",
+			transport == STAR6E_OUTPUT_TRANSPORT_UNIX ? "Unix" : "UDP");
+		return -1;
+	}
+	output->transport = transport;
+	return 0;
+}
+
+static int star6e_output_configure_socket(Star6eOutput *output,
+	Star6eOutputTransport transport, const char *host, uint16_t port,
+	const char *unix_name, int connected_udp)
+{
+	if (!output)
+		return -1;
+
+	if (star6e_output_open_socket(output, transport) != 0)
+		return -1;
+
+	output->connected_udp = 0;
+	if (transport == STAR6E_OUTPUT_TRANSPORT_UNIX) {
+		if (star6e_output_store_unix_destination(output, unix_name) != 0)
+			return -1;
+		return 0;
+	}
+
+	star6e_output_store_udp_destination(output, host, port);
+	output->connected_udp = connected_udp ? 1 : 0;
+	if (output->connected_udp) {
+		if (connect(output->socket_handle,
+		    (const struct sockaddr *)&output->dst,
+		    output->dst_len) != 0) {
+			fprintf(stderr,
+				"WARNING: UDP connect() failed (%d), using unconnected\n",
+				errno);
+			output->connected_udp = 0;
+		}
+	}
+
+	return 0;
 }
 
 static void star6e_output_setup_reset(Star6eOutputSetup *setup)
@@ -157,6 +254,17 @@ int star6e_output_prepare(Star6eOutputSetup *setup, const char *server_uri,
 		setup->transport = STAR6E_OUTPUT_TRANSPORT_SHM;
 		return 0;
 	}
+	if (strncmp(server_uri, "unix://", 7) == 0) {
+		snprintf(setup->unix_name, sizeof(setup->unix_name), "%s",
+			server_uri + 7);
+		if (!setup->unix_name[0]) {
+			fprintf(stderr, "ERROR: unix:// URI missing socket name\n");
+			return -1;
+		}
+		setup->transport = STAR6E_OUTPUT_TRANSPORT_UNIX;
+		setup->connected_udp = 0;
+		return 0;
+	}
 
 	if (venc_config_parse_server_uri(server_uri, setup->host,
 	    sizeof(setup->host), &setup->port) != 0) {
@@ -198,32 +306,14 @@ int star6e_output_init(Star6eOutput *output, const Star6eOutputSetup *setup)
 
 		output->transport = STAR6E_OUTPUT_TRANSPORT_SHM;
 		memset(&output->dst, 0, sizeof(output->dst));
-		output->dst.sin_family = AF_INET;
-		output->dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		output->dst_len = 0;
 		output->connected_udp = 0;
 		return 0;
 	}
 
-	output->socket_handle = socket(AF_INET, SOCK_DGRAM, 0);
-	if (output->socket_handle < 0) {
-		fprintf(stderr, "ERROR: Unable to create UDP socket\n");
-		return -1;
-	}
-
-	memset(&output->dst, 0, sizeof(output->dst));
-	output->dst.sin_family = AF_INET;
-	output->dst.sin_port = htons(setup->port);
-	output->dst.sin_addr.s_addr = inet_addr(setup->host);
-	if (output->connected_udp && output->dst.sin_addr.s_addr != 0) {
-		if (connect(output->socket_handle, (struct sockaddr *)&output->dst,
-		    sizeof(output->dst)) != 0) {
-			fprintf(stderr, "WARNING: UDP connect() failed (%d), using unconnected\n",
-				errno);
-			output->connected_udp = 0;
-		}
-	}
-
-	return 0;
+	return star6e_output_configure_socket(output, setup->transport,
+		setup->host, setup->port, setup->unix_name,
+		setup->connected_udp);
 }
 
 int star6e_output_is_rtp(const Star6eOutput *output)
@@ -272,7 +362,8 @@ int star6e_output_send_rtp_parts(const Star6eOutput *output,
 			payload1, (uint16_t)payload1_len);
 	}
 
-	if (star6e_output_send_udp_parts(output->socket_handle, &output->dst,
+	if (star6e_output_send_socket_parts(output->socket_handle, &output->dst,
+	    output->dst_len,
 	    header, header_len, payload1, payload1_len,
 	    payload2, payload2_len) != 0) {
 		((Star6eOutput *)output)->send_errors++;
@@ -293,16 +384,17 @@ int star6e_output_send_compact_packet(const Star6eOutput *output,
 	uint32_t timestamp;
 	uint32_t ssrc_id;
 	uint32_t max_fragment;
+	const struct sockaddr *dst = (const struct sockaddr *)&output->dst;
 
 	if (!output || output->socket_handle < 0 ||
-	    output->transport != STAR6E_OUTPUT_TRANSPORT_UDP ||
+	    output->transport == STAR6E_OUTPUT_TRANSPORT_SHM ||
 	    !packet || packet_size == 0) {
 		return -1;
 	}
 
 	if (packet_size <= max_size) {
 		(void)sendto(output->socket_handle, packet, packet_size, 0,
-			(const struct sockaddr *)&output->dst, sizeof(output->dst));
+			dst, output->dst_len);
 		return 0;
 	}
 
@@ -339,8 +431,8 @@ int star6e_output_send_compact_packet(const Star6eOutput *output,
 		vec[1].iov_len = fragment_size;
 
 		memset(&msg, 0, sizeof(msg));
-		msg.msg_name = (void *)&output->dst;
-		msg.msg_namelen = sizeof(output->dst);
+		msg.msg_name = (void *)dst;
+		msg.msg_namelen = output->dst_len;
 		msg.msg_iov = vec;
 		msg.msg_iovlen = 2;
 
@@ -421,38 +513,24 @@ size_t star6e_output_send_frame(const Star6eOutput *output,
 
 int star6e_output_apply_server(Star6eOutput *output, const char *uri)
 {
-	char host[128];
-	uint16_t port;
+	VencOutputUri parsed;
 
-	if (!output || output->transport != STAR6E_OUTPUT_TRANSPORT_UDP || !uri)
+	if (!output || output->ring || !uri)
 		return -1;
 
-	if (venc_config_parse_server_uri(uri, host, sizeof(host), &port) != 0)
+	if (venc_config_parse_output_uri(uri, &parsed) != 0)
 		return -1;
-
-	/* Create socket on first use (startup with outgoing.enabled=false
-	 * skips socket creation; the API may set a server later). */
-	if (output->socket_handle < 0) {
-		output->socket_handle = socket(AF_INET, SOCK_DGRAM, 0);
-		if (output->socket_handle < 0) {
-			fprintf(stderr, "ERROR: Unable to create UDP socket\n");
-			return -1;
-		}
+	if (parsed.type == VENC_OUTPUT_URI_SHM) {
+		fprintf(stderr, "ERROR: live switch to shm:// is not supported\n");
+		return -1;
 	}
 
-	output->dst.sin_family = AF_INET;
-	output->dst.sin_port = htons(port);
-	output->dst.sin_addr.s_addr = inet_addr(host);
-	if (output->connected_udp) {
-		if (connect(output->socket_handle, (struct sockaddr *)&output->dst,
-		    sizeof(output->dst)) != 0) {
-			fprintf(stderr, "WARNING: UDP connect to %s:%u failed (%d)\n",
-				host, port, errno);
-		}
+	return star6e_output_configure_socket(output,
+		parsed.type == VENC_OUTPUT_URI_UNIX ?
+		STAR6E_OUTPUT_TRANSPORT_UNIX : STAR6E_OUTPUT_TRANSPORT_UDP,
+		parsed.host, parsed.port, parsed.endpoint,
+		output->connected_udp);
 	}
-
-	return 0;
-}
 
 void star6e_output_teardown(Star6eOutput *output)
 {
@@ -469,6 +547,7 @@ void star6e_output_teardown(Star6eOutput *output)
 	}
 
 	memset(&output->dst, 0, sizeof(output->dst));
+	output->dst_len = 0;
 	output->connected_udp = 0;
 	output->transport = STAR6E_OUTPUT_TRANSPORT_UDP;
 }
@@ -496,6 +575,11 @@ int star6e_audio_output_init(Star6eAudioOutput *audio_output,
 	audio_output->video_output = video_output;
 	audio_output->port_override = port_override;
 	audio_output->max_payload_size = max_payload_size;
+	if (video_output->transport != STAR6E_OUTPUT_TRANSPORT_UDP) {
+		fprintf(stderr,
+			"[audio] ERROR: audio output requires udp:// video transport\n");
+		return -1;
+	}
 	if (port_override == 0) {
 		audio_output->socket_handle = video_output->socket_handle;
 		return 0;

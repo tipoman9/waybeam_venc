@@ -26,6 +26,8 @@ typedef struct {
 	uint16_t rtp_payload_size;
 	uint32_t udp_sink_ip;
 	uint16_t udp_sink_port;
+	VencOutputUriType output_uri_type;
+	char unix_socket_name[128];
 	uint16_t sidecar_port;
 	char shm_name[128];
 	PAYLOAD_TYPE_E rc_codec;

@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 #include "rtp_packetizer.h"
 #include "star6e.h"
@@ -16,7 +17,8 @@ typedef enum {
 
 typedef enum {
 	STAR6E_OUTPUT_TRANSPORT_UDP = 0,
-	STAR6E_OUTPUT_TRANSPORT_SHM = 1,
+	STAR6E_OUTPUT_TRANSPORT_UNIX = 1,
+	STAR6E_OUTPUT_TRANSPORT_SHM = 2,
 } Star6eOutputTransport;
 
 typedef struct {
@@ -27,6 +29,7 @@ typedef struct {
 	uint16_t max_frame_size;
 	char host[128];
 	uint16_t port;
+	char unix_name[128];
 	char shm_name[128];
 } Star6eOutputSetup;
 
@@ -34,7 +37,8 @@ typedef struct {
 	Star6eStreamMode stream_mode;
 	Star6eOutputTransport transport;
 	int socket_handle;
-	struct sockaddr_in dst;
+	struct sockaddr_storage dst;
+	socklen_t dst_len;
 	int connected_udp;
 	venc_ring_t *ring;
 	uint32_t send_errors;
