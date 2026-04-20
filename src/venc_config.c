@@ -580,8 +580,15 @@ int venc_config_parse_output_uri(const char *uri, VencOutputUri *out)
 		return 0;
 	}
 
+	if (strncmp(p, "wfb://", 6) == 0) {
+		out->type = VENC_OUTPUT_URI_WFB;
+		p += 6;
+		safe_strcpy(out->endpoint, sizeof(out->endpoint), p);
+		return 0;
+	}
+
 	fprintf(stderr, "[venc_config] ERROR: unsupported URI scheme in '%s' "
-		"(expected udp://, unix://, or shm://)\n", uri);
+		"(expected udp://, unix://, shm://, or wfb://)\n", uri);
 	return -1;
 }
 

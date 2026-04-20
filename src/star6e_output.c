@@ -2,6 +2,7 @@
 
 #include "output_socket.h"
 #include "venc_config.h"
+#include "wfb_tx.h"
 
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -186,6 +187,14 @@ int star6e_output_prepare(Star6eOutputSetup *setup, const char *server_uri,
 		return 0;
 	}
 
+	if (setup->uri.type == VENC_OUTPUT_URI_WFB) {
+		if (setup->stream_mode != STAR6E_STREAM_MODE_RTP) {
+			fprintf(stderr, "ERROR: wfb:// output requires RTP stream mode.\n");
+			return -1;
+		}
+		return 0;
+	}
+
 	return 0;
 }
 
@@ -220,6 +229,19 @@ int star6e_output_init(Star6eOutput *output, const Star6eOutputSetup *setup)
 		}
 
 		output->transport = VENC_OUTPUT_URI_SHM;
+		memset(&output->dst, 0, sizeof(output->dst));
+		output->dst_len = 0;
+		output->connected_udp = 0;
+		__atomic_fetch_add(&output->transport_gen, 2, __ATOMIC_RELEASE);
+		return 0;
+	}
+
+	if (setup->uri.type == VENC_OUTPUT_URI_WFB) {
+		if (wfb_tx_init_from_str(setup->uri.endpoint) != 0) {
+			fprintf(stderr, "ERROR: wfb_tx_init_from_str failed\n");
+			return -1;
+		}
+		output->transport = VENC_OUTPUT_URI_WFB;
 		memset(&output->dst, 0, sizeof(output->dst));
 		output->dst_len = 0;
 		output->connected_udp = 0;
@@ -263,6 +285,21 @@ int star6e_output_send_rtp_parts(Star6eOutput *output,
 	if (!output || !header || !payload1 || header_len == 0 || payload1_len == 0)
 		return -1;
 
+	if (output->transport == VENC_OUTPUT_URI_WFB) {
+		uint8_t pkt[2048];
+		size_t total = header_len + payload1_len + payload2_len;
+		if (total > sizeof(pkt)) {
+			output->send_errors++;
+			return -1;
+		}
+		memcpy(pkt, header, header_len);
+		memcpy(pkt + header_len, payload1, payload1_len);
+		if (payload2 && payload2_len > 0)
+			memcpy(pkt + header_len + payload1_len, payload2, payload2_len);
+		wfb_tx_send(pkt, total);
+		return 0;
+	}
+
 	if (output->ring) {
 		size_t total_payload = payload1_len + payload2_len;
 		if (header_len > UINT16_MAX || total_payload > UINT16_MAX)
@@ -305,6 +342,7 @@ int star6e_output_send_compact_packet(Star6eOutput *output,
 
 	if (!output || output->socket_handle < 0 ||
 	    output->transport == VENC_OUTPUT_URI_SHM ||
+	    output->transport == VENC_OUTPUT_URI_WFB ||
 	    !packet || packet_size == 0) {
 		return -1;
 	}
@@ -441,10 +479,18 @@ int star6e_output_apply_server(Star6eOutput *output, const char *uri)
 
 	if (!output || output->ring || !uri)
 		return -1;
+	if (output->transport == VENC_OUTPUT_URI_WFB) {
+		fprintf(stderr, "ERROR: live switch of wfb:// server is not supported\n");
+		return -1;
+	}
 	if (venc_config_parse_output_uri(uri, &parsed) != 0)
 		return -1;
 	if (parsed.type == VENC_OUTPUT_URI_SHM) {
 		fprintf(stderr, "ERROR: live switch to shm:// is not supported\n");
+		return -1;
+	}
+	if (parsed.type == VENC_OUTPUT_URI_WFB) {
+		fprintf(stderr, "ERROR: live switch to wfb:// is not supported\n");
 		return -1;
 	}
 
@@ -463,6 +509,9 @@ void star6e_output_teardown(Star6eOutput *output)
 {
 	if (!output)
 		return;
+
+	if (output->transport == VENC_OUTPUT_URI_WFB)
+		wfb_tx_destroy();
 
 	if (output->ring) {
 		venc_ring_destroy(output->ring);

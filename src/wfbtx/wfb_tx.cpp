@@ -9,15 +9,25 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <net/if.h>
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
+
+#include <cassert>
 #include <string>
 #include <vector>
 #include <memory>
 #include <stdexcept>
 
-#include "wifibroadcast.hpp"
-#include "tx.hpp"
+#include "zfex.h"
 
 using namespace std;
+
+#include "wifibroadcast.hpp"
+#include "tx.hpp"
 
 static unique_ptr<RawSocketTransmitter> g_tx;
 static uint64_t g_session_key_ts = 0;
@@ -39,14 +49,14 @@ int wfb_tx_init(int argc, char * const *argv)
     bool mirror = false;
     bool use_qdisc = false;
     uint32_t fwmark = 0;
-    uint32_t inject_retries = 0;
+    uint32_t inject_retries = 10;
     uint32_t inject_retry_delay = 5000;
     string keypair = "/etc/drone.key";
     uint8_t frame_type = FRAME_TYPE_DATA;
 
     optind = 1;
     while ((opt = getopt(argc, (char * const *)argv,
-                         "K:k:n:p:F:B:G:S:L:M:N:i:e:f:mVQP:J:E:")) != -1) {
+                         "K:k:n:p:F:B:G:S:L:M:N:i:e:f:mVQP:J:E:U:C:T:d:")) != -1) {
         switch (opt) {
         case 'K': keypair = optarg; break;
         case 'k': k = (uint8_t)atoi(optarg); break;
@@ -74,6 +84,9 @@ int wfb_tx_init(int argc, char * const *argv)
         case 'P': fwmark = (uint32_t)atoi(optarg); break;
         case 'J': inject_retries = (uint32_t)atoi(optarg); break;
         case 'E': inject_retry_delay = (uint32_t)atoi(optarg); break;
+        /* Socket-transport flags from the standalone wfb_tx CLI — silently
+         * ignored in embedded mode since there is no socket to read from. */
+        case 'U': case 'C': case 'T': case 'd': break;
         default:
             WFB_ERR("wfb_tx_init: unknown option\n");
             return -1;
@@ -200,4 +213,28 @@ void wfb_tx_destroy(void)
 {
     g_tx.reset();
     g_session_key_ts = 0;
+}
+
+int wfb_tx_init_from_str(const char *args_str)
+{
+    char buf[512];
+    char *argv_ptrs[32];
+    int argc = 0;
+    char *tok, *saveptr;
+
+    if (!args_str)
+        return -1;
+
+    strncpy(buf, args_str, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    argv_ptrs[argc++] = (char *)"wfb_tx";
+    tok = strtok_r(buf, " \t", &saveptr);
+    while (tok && argc < 31) {
+        argv_ptrs[argc++] = tok;
+        tok = strtok_r(NULL, " \t", &saveptr);
+    }
+    argv_ptrs[argc] = NULL;
+
+    return wfb_tx_init(argc, argv_ptrs);
 }

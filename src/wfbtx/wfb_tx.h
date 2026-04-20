@@ -33,6 +33,11 @@ extern "C" {
 
 int  wfb_tx_init(int argc, char * const *argv);
 
+/* Convenience: parse a space-separated args string (no argv[0] needed)
+ * and call wfb_tx_init().  Flags -U/-C/-T/-d are accepted and silently
+ * ignored (they are socket-transport flags unused in embedded mode). */
+int  wfb_tx_init_from_str(const char *args_str);
+
 int  wfb_tx_setup_radio(uint8_t stbc, int ldpc, int short_gi,
                          uint8_t bandwidth, uint8_t mcs_index,
                          int vht_mode, uint8_t vht_nss);

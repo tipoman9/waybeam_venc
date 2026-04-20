@@ -3,6 +3,7 @@
 #include "h26x_util.h"
 #include "rtp_packetizer.h"
 #include "rtp_session.h"
+#include "wfb_tx.h"
 
 #include <string.h>
 #include <sys/socket.h>
@@ -13,6 +14,7 @@ typedef struct {
 	const struct sockaddr_storage *dst;
 	socklen_t dst_len;
 	venc_ring_t *ring;
+	int use_wfb;
 } MarukoRtpWriteContext;
 
 static int maruko_rtp_write(const uint8_t *header, size_t header_len,
@@ -26,6 +28,20 @@ static int maruko_rtp_write(const uint8_t *header, size_t header_len,
 
 	if (!ctx || !header || !payload1 || header_len == 0 || payload1_len == 0)
 		return -1;
+
+	/* WFB path: flatten and inject via wfb_tx */
+	if (ctx->use_wfb) {
+		uint8_t pkt[2048];
+		size_t total = header_len + payload1_len + payload2_len;
+		if (total > sizeof(pkt))
+			return -1;
+		memcpy(pkt, header, header_len);
+		memcpy(pkt + header_len, payload1, payload1_len);
+		if (payload2 && payload2_len > 0)
+			memcpy(pkt + header_len + payload1_len, payload2, payload2_len);
+		wfb_tx_send(pkt, total);
+		return 0;
+	}
 
 	/* SHM path: write RTP packet to ring buffer (flatten payload parts) */
 	if (ctx->ring) {
@@ -71,7 +87,7 @@ static int maruko_rtp_write(const uint8_t *header, size_t header_len,
 
 static int maruko_send_rtp_packet(int socket_handle,
 	const struct sockaddr_storage *dst, socklen_t dst_len,
-	venc_ring_t *ring,
+	venc_ring_t *ring, int use_wfb,
 	const uint8_t *payload, size_t payload_len,
 	MarukoRtpState *rtp, int marker)
 {
@@ -80,12 +96,13 @@ static int maruko_send_rtp_packet(int socket_handle,
 		.dst = dst,
 		.dst_len = dst_len,
 		.ring = ring,
+		.use_wfb = use_wfb,
 	};
 	RtpPacketizerState state;
 	int ret;
 
 	if (!payload || payload_len == 0 || !rtp ||
-	    (socket_handle < 0 && !ring) || (!dst && !ring)) {
+	    (socket_handle < 0 && !ring && !use_wfb) || (!dst && !ring && !use_wfb)) {
 		return -1;
 	}
 
@@ -102,7 +119,7 @@ static int maruko_send_rtp_packet(int socket_handle,
 
 static size_t maruko_send_fu_h264(const uint8_t *data, size_t length,
 	int socket_handle, const struct sockaddr_storage *dst,
-	socklen_t dst_len, venc_ring_t *ring,
+	socklen_t dst_len, venc_ring_t *ring, int use_wfb,
 	MarukoRtpState *rtp, int is_last, size_t max_payload)
 {
 	const uint8_t nal_header = data[0];
@@ -120,6 +137,7 @@ static size_t maruko_send_fu_h264(const uint8_t *data, size_t length,
 		.dst = dst,
 		.dst_len = dst_len,
 		.ring = ring,
+		.use_wfb = use_wfb,
 	};
 	RtpPacketizerState state;
 
@@ -165,7 +183,7 @@ static size_t maruko_send_fu_h264(const uint8_t *data, size_t length,
 
 static size_t maruko_send_nal_rtp_h264(const uint8_t *data, size_t length,
 	int socket_handle, const struct sockaddr_storage *dst,
-	socklen_t dst_len, venc_ring_t *ring,
+	socklen_t dst_len, venc_ring_t *ring, int use_wfb,
 	MarukoRtpState *rtp, int is_last, size_t max_payload)
 {
 	if (!data || length == 0 || !rtp) {
@@ -174,16 +192,16 @@ static size_t maruko_send_nal_rtp_h264(const uint8_t *data, size_t length,
 
 	if (length <= max_payload) {
 		return maruko_send_rtp_packet(socket_handle, dst, dst_len, ring,
-			data, length, rtp, is_last ? 1 : 0) == 0 ? length : 0;
+			use_wfb, data, length, rtp, is_last ? 1 : 0) == 0 ? length : 0;
 	}
 
 	return maruko_send_fu_h264(data, length, socket_handle, dst, dst_len,
-		ring, rtp, is_last, max_payload);
+		ring, use_wfb, rtp, is_last, max_payload);
 }
 
 static size_t maruko_send_nal_rtp_hevc(const uint8_t *data, size_t length,
 	int socket_handle, const struct sockaddr_storage *dst,
-	socklen_t dst_len, venc_ring_t *ring,
+	socklen_t dst_len, venc_ring_t *ring, int use_wfb,
 	MarukoRtpState *rtp, int is_last, size_t max_payload)
 {
 	MarukoRtpWriteContext ctx = {
@@ -191,6 +209,7 @@ static size_t maruko_send_nal_rtp_hevc(const uint8_t *data, size_t length,
 		.dst = dst,
 		.dst_len = dst_len,
 		.ring = ring,
+		.use_wfb = use_wfb,
 	};
 	RtpPacketizerState state;
 	size_t total_bytes;
@@ -213,7 +232,7 @@ static size_t maruko_send_nal_rtp_hevc(const uint8_t *data, size_t length,
 static size_t maruko_send_prepend_param_sets(const H26xParamSets *params,
 	PAYLOAD_TYPE_E codec, uint8_t nal_type, int socket_handle,
 	const struct sockaddr_storage *dst, socklen_t dst_len, venc_ring_t *ring,
-	MarukoRtpState *rtp, size_t max_payload)
+	int use_wfb, MarukoRtpState *rtp, size_t max_payload)
 {
 	H26xParamSetRef refs[3];
 	size_t count;
@@ -230,11 +249,11 @@ static size_t maruko_send_prepend_param_sets(const H26xParamSets *params,
 			if (codec == PT_H265) {
 				total_bytes += maruko_send_nal_rtp_hevc(refs[i].data,
 					refs[i].len, socket_handle, dst, dst_len, ring,
-					rtp, 0, max_payload);
+					use_wfb, rtp, 0, max_payload);
 			} else {
 				total_bytes += maruko_send_nal_rtp_h264(refs[i].data,
 					refs[i].len, socket_handle, dst, dst_len, ring,
-					rtp, 0, max_payload);
+					use_wfb, rtp, 0, max_payload);
 			}
 		}
 
@@ -243,14 +262,17 @@ static size_t maruko_send_prepend_param_sets(const H26xParamSets *params,
 
 static size_t maruko_send_frame_rtp(const i6c_venc_strm *stream,
 	int socket_handle, const struct sockaddr_storage *dst,
-	socklen_t dst_len, venc_ring_t *ring,
+	socklen_t dst_len, venc_ring_t *ring, int use_wfb,
 	MarukoRtpState *rtp, H26xParamSets *params, PAYLOAD_TYPE_E codec,
 	size_t max_payload)
 {
 	size_t total_bytes = 0;
 	unsigned int i;
 
-	if (!stream || !dst || !rtp) {
+	if (!stream || !rtp) {
+		return 0;
+	}
+	if (!dst && !use_wfb) {
 		return 0;
 	}
 	if (codec != PT_H264 && codec != PT_H265) {
@@ -332,17 +354,17 @@ static size_t maruko_send_frame_rtp(const i6c_venc_strm *stream,
 		if (params) {
 			total_bytes += maruko_send_prepend_param_sets(params,
 				codec, nal_type, socket_handle, dst, dst_len, ring,
-				rtp, max_payload);
+				use_wfb, rtp, max_payload);
 		}
 
 			if (codec == PT_H265) {
 				total_bytes += maruko_send_nal_rtp_hevc(nal_ptr,
-					nal_len, socket_handle, dst, dst_len, ring, rtp,
-					last_nal, max_payload);
+					nal_len, socket_handle, dst, dst_len, ring,
+					use_wfb, rtp, last_nal, max_payload);
 			} else {
 				total_bytes += maruko_send_nal_rtp_h264(nal_ptr,
-					nal_len, socket_handle, dst, dst_len, ring, rtp,
-					last_nal, max_payload);
+					nal_len, socket_handle, dst, dst_len, ring,
+					use_wfb, rtp, last_nal, max_payload);
 			}
 		}
 	}
@@ -445,22 +467,25 @@ size_t maruko_video_send_frame(const i6c_venc_strm *stream,
 	H26xParamSets *params, MarukoBackendConfig *cfg)
 {
 	size_t total_bytes;
+	int use_wfb;
 
 	if (!stream || !output || !cfg)
 		return 0;
-	if (output->socket_handle < 0 && !output->ring)
+
+	use_wfb = (output->transport == VENC_OUTPUT_URI_WFB);
+	if (output->socket_handle < 0 && !output->ring && !use_wfb)
 		return 0;
 
 	if (cfg->stream_mode == MARUKO_STREAM_RTP) {
 		total_bytes = maruko_send_frame_rtp(stream, output->socket_handle,
-			&output->dst, output->dst_len, output->ring, rtp, params,
+			&output->dst, output->dst_len, output->ring, use_wfb, rtp, params,
 			cfg->rc_codec, cfg->rtp_payload_size);
-	} else if (!output->ring) {
+	} else if (!output->ring && !use_wfb) {
 		total_bytes = maruko_send_frame_compact(stream,
 			output->socket_handle, &output->dst, output->dst_len,
 			cfg->max_frame_size);
 	} else {
-		/* Compact mode not supported over SHM */
+		/* Compact mode not supported over SHM or WFB */
 		return 0;
 	}
 

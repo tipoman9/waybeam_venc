@@ -72,7 +72,7 @@ typedef struct {
 typedef struct {
 	bool enabled;
 	char server[VENC_CONFIG_STRING_MAX]; /* "udp://host:port", "unix://name",
-	                                      * or "shm://name" */
+	                                      * "shm://name", or "wfb://<args>" */
 	char stream_mode[16];               /* "rtp" or "compact" */
 	uint16_t max_payload_size;
 	bool connected_udp;             /* connect() socket (skip per-packet routing) */
@@ -155,6 +155,7 @@ typedef enum {
 	VENC_OUTPUT_URI_UDP = 0,
 	VENC_OUTPUT_URI_UNIX = 1,
 	VENC_OUTPUT_URI_SHM = 2,
+	VENC_OUTPUT_URI_WFB = 3,
 } VencOutputUriType;
 
 typedef struct {

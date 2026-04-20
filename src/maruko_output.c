@@ -1,6 +1,7 @@
 #include "maruko_output.h"
 
 #include "output_socket.h"
+#include "wfb_tx.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -18,6 +19,16 @@ int maruko_output_init(MarukoOutput *output, const VencOutputUri *uri)
 	output->dst_len = 0;
 	output->transport = VENC_OUTPUT_URI_UDP;
 	memset(&output->dst, 0, sizeof(output->dst));
+
+	if (uri->type == VENC_OUTPUT_URI_WFB) {
+		output->transport = VENC_OUTPUT_URI_WFB;
+		if (wfb_tx_init_from_str(uri->endpoint) != 0) {
+			fprintf(stderr, "ERROR: [maruko] wfb_tx_init_from_str failed\n");
+			return -1;
+		}
+		printf("> [maruko] WFB output initialized\n");
+		return 0;
+	}
 
 	return output_socket_configure(&output->socket_handle, &output->dst,
 		&output->dst_len, &output->transport, uri, 0, NULL);
@@ -57,9 +68,13 @@ int maruko_output_apply_server(MarukoOutput *output, const char *uri)
 	if (!output || !uri)
 		return -1;
 
-	/* SHM output doesn't support live server change */
+	/* SHM and WFB outputs don't support live server change */
 	if (output->ring) {
 		fprintf(stderr, "ERROR: [maruko] cannot change server in SHM mode\n");
+		return -1;
+	}
+	if (output->transport == VENC_OUTPUT_URI_WFB) {
+		fprintf(stderr, "ERROR: [maruko] cannot change server in WFB mode\n");
 		return -1;
 	}
 
@@ -67,6 +82,10 @@ int maruko_output_apply_server(MarukoOutput *output, const char *uri)
 		return -1;
 	if (parsed.type == VENC_OUTPUT_URI_SHM) {
 		fprintf(stderr, "ERROR: [maruko] cannot change server to shm:// live\n");
+		return -1;
+	}
+	if (parsed.type == VENC_OUTPUT_URI_WFB) {
+		fprintf(stderr, "ERROR: [maruko] cannot change server to wfb:// live\n");
 		return -1;
 	}
 
@@ -78,6 +97,9 @@ void maruko_output_teardown(MarukoOutput *output)
 {
 	if (!output)
 		return;
+
+	if (output->transport == VENC_OUTPUT_URI_WFB)
+		wfb_tx_destroy();
 
 	if (output->ring) {
 		venc_ring_destroy(output->ring);
