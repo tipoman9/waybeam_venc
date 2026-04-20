@@ -10,8 +10,10 @@ TOOLCHAIN_MARUKO_TGZ := toolchain.sigmastar-infinity6c.tgz
 TOOLCHAIN_MARUKO_DIR := toolchain/toolchain.sigmastar-infinity6c
 CC_MARUKO_BIN := $(TOOLCHAIN_MARUKO_DIR)/bin/arm-openipc-linux-musleabihf-gcc
 
-STAR6E_CC ?= $(TOOLCHAIN_DIR)/bin/arm-openipc-linux-gnueabihf-gcc
-MARUKO_CC ?= $(TOOLCHAIN_MARUKO_DIR)/bin/arm-openipc-linux-musleabihf-gcc
+STAR6E_CC  ?= $(TOOLCHAIN_DIR)/bin/arm-openipc-linux-gnueabihf-gcc
+STAR6E_CXX ?= $(TOOLCHAIN_DIR)/bin/arm-openipc-linux-gnueabihf-g++
+MARUKO_CC  ?= $(TOOLCHAIN_MARUKO_DIR)/bin/arm-openipc-linux-musleabihf-gcc
+MARUKO_CXX ?= $(TOOLCHAIN_MARUKO_DIR)/bin/arm-openipc-linux-musleabihf-g++
 
 OUT_DIR := out/$(SOC_BUILD)
 TARGET := $(OUT_DIR)/venc
@@ -29,7 +31,8 @@ COMMON_LDFLAGS := -Wl,-rpath,$(LIB_RUNPATH) -Wl,--no-as-needed
 
 # BASE_LIBS is set per-SOC below — all MI libs are loaded via dlopen at runtime.
 ifeq ($(SOC_BUILD),maruko)
-CC := $(MARUKO_CC)
+CC  := $(MARUKO_CC)
+CXX := $(MARUKO_CXX)
 SRC := src/main.c src/backend_maruko.c $(MARUKO_ONLY_SRC) $(HELPER_SRC) $(CONFIG_SRC)
 DRV :=
 DRV_EXTRA :=
@@ -41,7 +44,8 @@ BASE_LIBS := -Wl,--start-group -lpthread -ldl -lrt -Wl,--end-group
 BUILD_TESTS := 0
 TOOLCHAIN_TARGET := toolchain-maruko
 else ifeq ($(SOC_BUILD),star6e)
-CC := $(STAR6E_CC)
+CC  := $(STAR6E_CC)
+CXX := $(STAR6E_CXX)
 SRC := src/main.c src/backend_star6e.c src/star6e_mi.c $(STAR6E_ONLY_SRC) $(HELPER_SRC) $(CONFIG_SRC)
 DRV :=
 DRV_EXTRA :=
@@ -55,6 +59,25 @@ TOOLCHAIN_TARGET := toolchain
 else
 $(error Unsupported SOC_BUILD '$(SOC_BUILD)'; expected 'star6e' or 'maruko')
 endif
+
+# ── wfbtx embedded module ─────────────────────────────────────────────
+# Requires libsodium built by wfb/build_wfb_tx.sh (run once before make build).
+WFB_SODIUM_PREFIX := wfb/build/sodium-install
+WFB_TX_CXXFLAGS := -Os -std=gnu++11 \
+    -Isrc/wfbtx -I$(WFB_SODIUM_PREFIX)/include \
+    -DZFEX_UNROLL_ADDMUL_SIMD=8 -DZFEX_INLINE_ADDMUL -DZFEX_INLINE_ADDMUL_SIMD \
+    $(SOC_CFLAGS)
+WFB_TX_CFLAGS_ZFEX := -Os -std=gnu99 \
+    -Isrc/wfbtx \
+    -DZFEX_UNROLL_ADDMUL_SIMD=8 -DZFEX_INLINE_ADDMUL -DZFEX_INLINE_ADDMUL_SIMD \
+    $(SOC_CFLAGS)
+WFB_TX_CPP_SRCS := src/wfbtx/wifibroadcast.cpp \
+                   src/wfbtx/tx_core.cpp \
+                   src/wfbtx/wfb_tx.cpp
+WFB_TX_C_SRCS   := src/wfbtx/zfex.c
+WFB_TX_OBJS     := $(patsubst src/wfbtx/%.cpp,$(OUT_DIR)/wfbtx/%.o,$(WFB_TX_CPP_SRCS)) \
+                   $(patsubst src/wfbtx/%.c,$(OUT_DIR)/wfbtx/%.o,$(WFB_TX_C_SRCS))
+WFB_TX_LIBS     := $(WFB_SODIUM_PREFIX)/lib/libsodium.a -lstdc++
 
 CFLAGS += $(COMMON_CFLAGS) $(SOC_CFLAGS) $(SOC_DEFS)
 LDFLAGS += $(COMMON_LDFLAGS) $(SOC_LDFLAGS)
@@ -87,6 +110,15 @@ build: $(TARGET)
 $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
+$(OUT_DIR)/wfbtx:
+	mkdir -p $(OUT_DIR)/wfbtx
+
+$(OUT_DIR)/wfbtx/%.o: src/wfbtx/%.cpp | $(OUT_DIR)/wfbtx
+	$(CXX) $(WFB_TX_CXXFLAGS) -c -o $@ $<
+
+$(OUT_DIR)/wfbtx/zfex.o: src/wfbtx/zfex.c | $(OUT_DIR)/wfbtx
+	$(CC) $(WFB_TX_CFLAGS_ZFEX) -c -o $@ $<
+
 check-soc-stamp:
 	@true
 
@@ -102,8 +134,8 @@ check:
 lint: $(TOOLCHAIN_TARGET) check
 	$(CC) $(CFLAGS) -Wall -Wextra -Werror -Wno-unused-parameter -Wno-old-style-declaration -fsyntax-only $(SRC)
 
-$(TARGET): $(SRC) include/backend.h include/codec_config.h include/codec_types.h include/file_util.h include/h26x_param_sets.h include/h26x_util.h include/isp_runtime.h include/maruko_bindings.h include/maruko_config.h include/maruko_controls.h include/maruko_output.h include/maruko_pipeline.h include/maruko_runtime.h include/maruko_video.h include/output_socket.h include/rtp_packetizer.h include/rtp_session.h include/rtp_sidecar.h include/sdk_quiet.h include/star6e_audio.h include/star6e_controls.h include/star6e_cus3a.h include/star6e_hevc_rtp.h include/star6e_output.h include/star6e_pipeline.h include/star6e_recorder.h include/star6e_ts_recorder.h include/ts_mux.h include/audio_ring.h include/star6e_runtime.h include/star6e_video.h include/stream_metrics.h include/venc_config.h include/venc_httpd.h include/venc_api.h include/sensor_select.h include/venc_ring.h include/star6e.h include/sigmastar_types.h include/ssc338q_compat.h include/maruko_mi.h include/star6e_mi.h include/imu_bmi270.h include/eis.h include/eis_ring.h include/eis_gyroglide.h include/debug_osd.h
-	$(CC) $(CFLAGS) $(LDFLAGS) $(SRC) $(if $(DRV),-L$(DRV),) $(if $(DRV_EXTRA),-L$(DRV_EXTRA),) $(if $(DRV),-Ltools,) $(BASE_LIBS) $(SOC_LIBS) -o $@
+$(TARGET): $(SRC) $(WFB_TX_OBJS) include/backend.h include/codec_config.h include/codec_types.h include/file_util.h include/h26x_param_sets.h include/h26x_util.h include/isp_runtime.h include/maruko_bindings.h include/maruko_config.h include/maruko_controls.h include/maruko_output.h include/maruko_pipeline.h include/maruko_runtime.h include/maruko_video.h include/output_socket.h include/rtp_packetizer.h include/rtp_session.h include/rtp_sidecar.h include/sdk_quiet.h include/star6e_audio.h include/star6e_controls.h include/star6e_cus3a.h include/star6e_hevc_rtp.h include/star6e_output.h include/star6e_pipeline.h include/star6e_recorder.h include/star6e_ts_recorder.h include/ts_mux.h include/audio_ring.h include/star6e_runtime.h include/star6e_video.h include/stream_metrics.h include/venc_config.h include/venc_httpd.h include/venc_api.h include/sensor_select.h include/venc_ring.h include/star6e.h include/sigmastar_types.h include/ssc338q_compat.h include/maruko_mi.h include/star6e_mi.h include/imu_bmi270.h include/eis.h include/eis_ring.h include/eis_gyroglide.h include/debug_osd.h
+	$(CC) $(CFLAGS) $(LDFLAGS) $(SRC) $(WFB_TX_OBJS) $(if $(DRV),-L$(DRV),) $(if $(DRV_EXTRA),-L$(DRV_EXTRA),) $(if $(DRV),-Ltools,) $(BASE_LIBS) $(SOC_LIBS) $(WFB_TX_LIBS) -o $@
 
 # Host-native timing probe (no cross-compiler or SDK libs needed)
 $(TIMING_PROBE_TARGET): $(TIMING_PROBE_SRC) include/rtp_sidecar.h
