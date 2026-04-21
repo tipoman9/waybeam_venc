@@ -203,7 +203,11 @@ void wfb_tx_send(const uint8_t *buf, size_t size)
             g_session_key_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
         }
 
+        uint64_t t0 = get_time_us();
         g_tx->send_packet(buf, size, 0);
+        uint64_t now_us = get_time_us();
+        g_tx->update_send_delay(now_us - t0);
+        g_tx->check_metrics(now_us);
     } catch (runtime_error &e) {
         WFB_ERR("wfb_tx_send: %s\n", e.what());
     }

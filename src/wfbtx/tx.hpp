@@ -86,6 +86,35 @@ protected:
     virtual void inject_packet(const uint8_t *buf, size_t size) = 0;
     virtual void set_mark(uint32_t idx) = 0;
 
+    uint64_t encrypt_us_acc;
+    uint64_t fec_us_acc;
+    uint64_t inject_us_acc;
+    uint64_t metrics_window_start_us;
+    uint64_t delay_us_sum;
+    uint32_t delay_count;
+    uint64_t delay_max_us;
+    uint64_t pkt_ring[10];
+    uint32_t ring_pos;
+    uint32_t ring_fill;
+    uint64_t group10_max_us;
+
+public:
+    void update_send_delay(uint64_t us) {
+        delay_us_sum += us;
+        delay_count += 1;
+        if (us > delay_max_us) delay_max_us = us;
+
+        pkt_ring[ring_pos] = us;
+        ring_pos = (ring_pos + 1) % 10;
+        if (ring_fill < 10) ring_fill++;
+        if (ring_fill == 10) {
+            uint64_t sum = 0;
+            for (int i = 0; i < 10; i++) sum += pkt_ring[i];
+            if (sum > group10_max_us) group10_max_us = sum;
+        }
+    }
+    void check_metrics(uint64_t now_us);
+
 private:
     Transmitter(const Transmitter&);
     Transmitter& operator=(const Transmitter&);

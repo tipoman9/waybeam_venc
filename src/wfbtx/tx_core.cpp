@@ -60,7 +60,11 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
     session_key{},
     session_packet{},
     session_packet_size(0),
-    tags(tags)
+    tags(tags),
+    encrypt_us_acc(0), fec_us_acc(0), inject_us_acc(0),
+    metrics_window_start_us(0),
+    delay_us_sum(0), delay_count(0), delay_max_us(0),
+    pkt_ring{}, ring_pos(0), ring_fill(0), group10_max_us(0)
 {
 
     FILE *fp;
@@ -343,8 +347,10 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
             }
         }
 
+        uint64_t end_us = get_time_us();
         uint64_t key = (uint64_t)(current_output) << 8 | (uint64_t)0xff;
-        antenna_stat[key].log_latency(get_time_us() - start_us, rc >= 0, size);
+        antenna_stat[key].log_latency(end_us - start_us, rc >= 0, size);
+        inject_us_acc += end_us - start_us;
     }
     else
     {
@@ -631,12 +637,16 @@ void Transmitter::send_block_fragment(size_t packet_size)
     block_hdr->data_nonce = htobe64(((block_idx & BLOCK_IDX_MASK) << 8) + fragment_idx);
 
     // encrypted payload
-    if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
-                                             block[fragment_idx], packet_size,
-                                             (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
-                                             NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
     {
-        throw runtime_error("Unable to encrypt packet!");
+        uint64_t t0 = get_time_us();
+        if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
+                                                 block[fragment_idx], packet_size,
+                                                 (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
+                                                 NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
+        {
+            throw runtime_error("Unable to encrypt packet!");
+        }
+        encrypt_us_acc += get_time_us() - t0;
     }
 
     inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
@@ -683,8 +693,12 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
 
     if (fragment_idx < fec_k)  return true;
 
-    zfex_status_code_t _rc = fec_encode_simd(fec_p, (const uint8_t**)block, block + fec_k, ZFEX_ROUND_UP_SIMD(max_packet_size));
-    assert(_rc == ZFEX_SC_OK);
+    {
+        uint64_t t0 = get_time_us();
+        zfex_status_code_t _rc = fec_encode_simd(fec_p, (const uint8_t**)block, block + fec_k, ZFEX_ROUND_UP_SIMD(max_packet_size));
+        fec_us_acc += get_time_us() - t0;
+        assert(_rc == ZFEX_SC_OK);
+    }
 
     // mark fec packets with fwmark + 1
     set_mark(1);
@@ -722,6 +736,33 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
     }
 
     return true;
+}
+
+void Transmitter::check_metrics(uint64_t now_us)
+{
+    if (metrics_window_start_us == 0) {
+        metrics_window_start_us = now_us;
+        return;
+    }
+    if (now_us - metrics_window_start_us < 1000000ULL)
+        return;
+
+    double avg_ms = delay_count > 0 ? (delay_us_sum / (double)delay_count) / 1000.0 : 0.0;
+    printf("wfb_tx: inject=%ums enc=%ums fec=%ums avg=%.1fms max=%.1fms grp10max=%.1fms /s\n",
+           (unsigned)(inject_us_acc / 1000),
+           (unsigned)(encrypt_us_acc / 1000),
+           (unsigned)(fec_us_acc / 1000),
+           avg_ms,
+           delay_max_us / 1000.0,
+           group10_max_us / 1000.0);
+    inject_us_acc = 0;
+    encrypt_us_acc = 0;
+    fec_us_acc = 0;
+    delay_us_sum = 0;
+    delay_count = 0;
+    delay_max_us = 0;
+    group10_max_us = 0;
+    metrics_window_start_us = now_us;
 }
 
 // Extract SO_RXQ_OVFL counter
