@@ -336,6 +336,8 @@ static void load_outgoing(const cJSON *root, VencConfigOutgoing *s)
 		(int)s->audio_port);
 	s->sidecar_port = (uint16_t)json_get_int(obj, "sidecarPort",
 		(int)s->sidecar_port);
+	s->disable_packet_aggregation = json_get_bool(obj, "disablePacketAggregation",
+		s->disable_packet_aggregation);
 }
 
 static void load_audio(const cJSON *root, VencConfigAudio *a)
@@ -671,6 +673,8 @@ static cJSON *config_to_cjson(const VencConfig *cfg)
 		cJSON_AddBoolToObject(out, "connectedUdp", cfg->outgoing.connected_udp);
 		cJSON_AddNumberToObject(out, "audioPort", cfg->outgoing.audio_port);
 		cJSON_AddNumberToObject(out, "sidecarPort", cfg->outgoing.sidecar_port);
+		cJSON_AddBoolToObject(out, "disablePacketAggregation",
+			cfg->outgoing.disable_packet_aggregation);
 	}
 
 	/* fpv */

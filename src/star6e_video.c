@@ -26,6 +26,7 @@ typedef struct {
 	size_t max_payload;
 	Star6eHevcRtpStats *stats;
 	int slices_enabled;
+	int no_aggregation;
 } Star6eRtpFrameContext;
 
 static size_t send_frame_output_rtp(Star6eOutput *output,
@@ -45,7 +46,7 @@ static size_t send_frame_output_rtp(Star6eOutput *output,
 
 	return star6e_hevc_rtp_send_frame(stream, output, ctx->rtp,
 		ctx->frame_ticks, ctx->params, ctx->max_payload, ctx->stats,
-		end_of_frame);
+		end_of_frame, ctx->no_aggregation);
 }
 
 void star6e_video_reset(Star6eVideoState *state)
@@ -68,6 +69,7 @@ void star6e_video_init(Star6eVideoState *state, const VencConfig *vcfg,
 	state->max_frame_size = vcfg->outgoing.max_payload_size;
 	state->rtp_payload_size = vcfg->outgoing.max_payload_size;
 	state->slices_enabled = (vcfg->video0.slice_rows > 0) ? 1 : 0;
+	state->no_aggregation = vcfg->outgoing.disable_packet_aggregation ? 1 : 0;
 
 	if (output && star6e_output_is_rtp(output)) {
 		RtpSessionState session;
@@ -112,6 +114,7 @@ size_t star6e_video_send_frame(Star6eVideoState *state,
 			.max_payload = state->rtp_payload_size,
 			.stats = verbose_enabled ? &frame_packetizer : NULL,
 			.slices_enabled = state->slices_enabled,
+			.no_aggregation = state->no_aggregation,
 		};
 
 		rtp_sidecar_poll(&state->sidecar);

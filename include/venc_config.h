@@ -81,6 +81,7 @@ typedef struct {
 	                                     * audio and video RTP on one socket causes
 	                                     * video decoder instability at the receiver */
 	uint16_t sidecar_port;              /* 0 = disabled */
+	bool disable_packet_aggregation;    /* send each slice NAL as its own RTP packet */
 } VencConfigOutgoing;
 
 typedef struct {

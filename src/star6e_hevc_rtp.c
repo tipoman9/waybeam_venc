@@ -169,7 +169,8 @@ static size_t send_nal_rtp_hevc(const uint8_t *data, size_t length,
 
 static size_t send_or_queue_nal_rtp_hevc(const uint8_t *data, size_t length,
 	Star6eOutput *output, RtpPacketizerState *rtp, HevcApBuilder *ap,
-	int is_last, size_t max_payload, Star6eHevcRtpStats *stats)
+	int is_last, size_t max_payload, Star6eHevcRtpStats *stats,
+	int no_aggregation)
 {
 	size_t total_bytes = 0;
 
@@ -179,7 +180,7 @@ static size_t send_or_queue_nal_rtp_hevc(const uint8_t *data, size_t length,
 	if (stats)
 		stats->total_nals++;
 
-	if (length > max_payload || length > UINT16_MAX) {
+	if (no_aggregation || length > max_payload || length > UINT16_MAX) {
 		total_bytes += hevc_ap_flush(ap, output, rtp, 0, stats);
 		total_bytes += send_nal_rtp_hevc(data, length, output, rtp,
 			is_last, max_payload, stats);
@@ -203,7 +204,8 @@ static size_t send_or_queue_nal_rtp_hevc(const uint8_t *data, size_t length,
 
 static size_t send_prepend_param_sets_hevc(const H26xParamSets *params,
 	uint8_t nal_type, Star6eOutput *output, RtpPacketizerState *rtp,
-	HevcApBuilder *ap, size_t max_payload, Star6eHevcRtpStats *stats)
+	HevcApBuilder *ap, size_t max_payload, Star6eHevcRtpStats *stats,
+	int no_aggregation)
 {
 	H26xParamSetRef refs[3];
 	size_t count;
@@ -216,7 +218,7 @@ static size_t send_prepend_param_sets_hevc(const H26xParamSets *params,
 		sizeof(refs) / sizeof(refs[0]));
 	for (size_t i = 0; i < count; ++i) {
 		total_bytes += send_or_queue_nal_rtp_hevc(refs[i].data, refs[i].len,
-			output, rtp, ap, 0, max_payload, stats);
+			output, rtp, ap, 0, max_payload, stats, no_aggregation);
 	}
 
 	return total_bytes;
@@ -225,7 +227,7 @@ static size_t send_prepend_param_sets_hevc(const H26xParamSets *params,
 size_t star6e_hevc_rtp_send_frame(const MI_VENC_Stream_t *stream,
 	Star6eOutput *output, RtpPacketizerState *rtp,
 	uint32_t frame_ticks, H26xParamSets *params, size_t max_payload,
-	Star6eHevcRtpStats *stats, int end_of_frame)
+	Star6eHevcRtpStats *stats, int end_of_frame, int no_aggregation)
 {
 	size_t total_bytes = 0;
 	HevcApBuilder ap;
@@ -298,11 +300,11 @@ size_t star6e_hevc_rtp_send_frame(const MI_VENC_Stream_t *stream,
 
 			if (params) {
 				total_bytes += send_prepend_param_sets_hevc(params, nal_type,
-					output, rtp, &ap, max_payload, stats);
+					output, rtp, &ap, max_payload, stats, no_aggregation);
 			}
 
 			total_bytes += send_or_queue_nal_rtp_hevc(nal_ptr, nal_len, output,
-				rtp, &ap, last_nal, max_payload, stats);
+				rtp, &ap, last_nal, max_payload, stats, no_aggregation);
 		}
 	}
 

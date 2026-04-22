@@ -173,7 +173,8 @@ static const FieldDesc g_fields[] = {
 	FIELD(outgoing, max_payload_size,  FT_UINT16, MUT_RESTART),
 	FIELD(outgoing, connected_udp,     FT_BOOL,   MUT_RESTART),
 	FIELD(outgoing, audio_port,        FT_UINT16, MUT_RESTART),
-	FIELD(outgoing, sidecar_port,      FT_UINT16, MUT_RESTART),
+	FIELD(outgoing, sidecar_port,               FT_UINT16, MUT_RESTART),
+	FIELD(outgoing, disable_packet_aggregation, FT_BOOL,   MUT_RESTART),
 
 	FIELD(isp, legacy_ae,      FT_BOOL,   MUT_RESTART),
 	FIELD(isp, ae_fps,         FT_UINT,   MUT_RESTART),
@@ -292,7 +293,8 @@ static const FieldAlias g_field_aliases[] = {
 	{ "video0.sceneHoldoff", "video0.scene_holdoff" },
 	{ "video0.sliceRows", "video0.slice_rows" },
 	{ "outgoing.sidecarPort", "outgoing.sidecar_port" },
-	{ "outgoing.connectedUdp", "outgoing.connected_udp" },
+	{ "outgoing.connectedUdp",             "outgoing.connected_udp" },
+	{ "outgoing.disablePacketAggregation", "outgoing.disable_packet_aggregation" },
 	{ "outgoing.streamMode", "outgoing.stream_mode" },
 	{ "debug.showOsd", "debug.show_osd" },
 };

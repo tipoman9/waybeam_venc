@@ -25,6 +25,6 @@ typedef struct {
 size_t star6e_hevc_rtp_send_frame(const MI_VENC_Stream_t *stream,
 	Star6eOutput *output, RtpPacketizerState *rtp,
 	uint32_t frame_ticks, H26xParamSets *params, size_t max_payload,
-	Star6eHevcRtpStats *stats, int end_of_frame);
+	Star6eHevcRtpStats *stats, int end_of_frame, int no_aggregation);
 
 #endif /* STAR6E_HEVC_RTP_H */
