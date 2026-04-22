@@ -523,7 +523,7 @@ static void star6e_pipeline_fill_h26x_attr(i6_venc_attr_h26x *attr,
 
 static int star6e_pipeline_start_venc(uint32_t width, uint32_t height,
 	uint32_t bitrate, uint32_t framerate, uint32_t gop, PAYLOAD_TYPE_E codec,
-	int rc_mode, bool frame_lost_enabled, MI_VENC_CHN *chn)
+	int rc_mode, bool frame_lost_enabled, int slice_rows, MI_VENC_CHN *chn)
 {
 	MI_VENC_ChnAttr_t attr = {0};
 	MI_U32 bit_rate_bits;
@@ -631,6 +631,18 @@ static int star6e_pipeline_start_venc(uint32_t width, uint32_t height,
 		fprintf(stderr, "ERROR: MI_VENC_CreateChn(%d) failed %d\n",
 			*chn, ret);
 		return ret;
+	}
+
+	if (slice_rows > 0) {
+		struct { int bSplitEnable; uint32_t u32SliceRowCount; } sp = {
+			.bSplitEnable = 1,
+			.u32SliceRowCount = (uint32_t)slice_rows,
+		};
+
+		if (codec == PT_H265 && g_mi_venc.fnSetH265SliceSplit)
+			g_mi_venc.fnSetH265SliceSplit(*chn, &sp);
+		else if (codec != PT_H265 && g_mi_venc.fnSetH264SliceSplit)
+			g_mi_venc.fnSetH264SliceSplit(*chn, &sp);
 	}
 
 	ret = MI_VENC_StartRecvPic(*chn);
@@ -1499,7 +1511,8 @@ int star6e_pipeline_reinit(Star6ePipelineState *state, const VencConfig *vcfg,
 	ret = star6e_pipeline_start_venc(pconf.image_width, pconf.image_height,
 		pconf.venc_max_rate, venc_fps, pconf.venc_gop_size,
 		pconf.rc_codec, pconf.rc_mode,
-		vcfg->video0.frame_lost, &state->venc_channel);
+		vcfg->video0.frame_lost, vcfg->video0.slice_rows,
+		&state->venc_channel);
 	if (ret != 0)
 		return ret;
 
@@ -1556,7 +1569,8 @@ int star6e_pipeline_start(Star6ePipelineState *state, const VencConfig *vcfg,
 	ret = star6e_pipeline_start_venc(pconf.image_width, pconf.image_height,
 		pconf.venc_max_rate, venc_fps, pconf.venc_gop_size,
 		pconf.rc_codec, pconf.rc_mode,
-		vcfg->video0.frame_lost, &state->venc_channel);
+		vcfg->video0.frame_lost, vcfg->video0.slice_rows,
+		&state->venc_channel);
 	if (ret != 0)
 		goto fail_vpe;
 
@@ -1613,7 +1627,7 @@ int star6e_pipeline_start_dual(Star6ePipelineState *state,
 
 	ret = star6e_pipeline_start_venc(state->image_width,
 		state->image_height, bitrate, fps, gop,
-		PT_H265, 3 /* CBR */, frame_lost, &d->channel);
+		PT_H265, 3 /* CBR */, frame_lost, 0, &d->channel);
 	if (ret != 0) {
 		fprintf(stderr, "WARNING: dual VENC ch1 create failed (%d), "
 			"falling back to mirror mode\n", ret);

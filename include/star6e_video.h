@@ -21,6 +21,7 @@ typedef struct {
 	uint16_t max_frame_size;
 	uint16_t rtp_payload_size;
 	unsigned int frame_counter;
+	int slices_enabled;
 	StreamMetricsState verbose_metrics;
 	Star6eHevcRtpStats verbose_packetizer_interval;
 	RtpSidecarSender sidecar;

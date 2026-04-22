@@ -225,7 +225,7 @@ static size_t send_prepend_param_sets_hevc(const H26xParamSets *params,
 size_t star6e_hevc_rtp_send_frame(const MI_VENC_Stream_t *stream,
 	Star6eOutput *output, RtpPacketizerState *rtp,
 	uint32_t frame_ticks, H26xParamSets *params, size_t max_payload,
-	Star6eHevcRtpStats *stats)
+	Star6eHevcRtpStats *stats, int end_of_frame)
 {
 	size_t total_bytes = 0;
 	HevcApBuilder ap;
@@ -291,7 +291,8 @@ size_t star6e_hevc_rtp_send_frame(const MI_VENC_Stream_t *stream,
 			if (params)
 				h26x_param_sets_update(params, PT_H265, nal_type, nal_ptr, nal_len);
 
-			last_nal = (i == stream->count - 1) &&
+			last_nal = end_of_frame &&
+				(i == stream->count - 1) &&
 				((pack->packNum > 0 && k == nal_count - 1) ||
 				 (pack->packNum == 0));
 
@@ -305,7 +306,8 @@ size_t star6e_hevc_rtp_send_frame(const MI_VENC_Stream_t *stream,
 		}
 	}
 
-	total_bytes += hevc_ap_flush(&ap, output, rtp, 1, stats);
-	rtp->timestamp += frame_ticks;
+	total_bytes += hevc_ap_flush(&ap, output, rtp, end_of_frame, stats);
+	if (end_of_frame)
+		rtp->timestamp += frame_ticks;
 	return total_bytes;
 }

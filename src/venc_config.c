@@ -316,6 +316,8 @@ static void load_video0(const cJSON *root, VencConfigVideo *v)
 	v->scene_holdoff = (uint8_t)json_get_int(obj, "sceneHoldoff",
 		(int)v->scene_holdoff);
 	if (v->scene_holdoff < 1 && v->scene_threshold > 0) v->scene_holdoff = 1;
+	v->slice_rows = json_get_int(obj, "sliceRows", v->slice_rows);
+	if (v->slice_rows < 0) v->slice_rows = 0;
 }
 
 static void load_outgoing(const cJSON *root, VencConfigOutgoing *s)
@@ -656,6 +658,7 @@ static cJSON *config_to_cjson(const VencConfig *cfg)
 		cJSON_AddBoolToObject(vid, "frameLost", cfg->video0.frame_lost);
 		cJSON_AddNumberToObject(vid, "sceneThreshold", cfg->video0.scene_threshold);
 		cJSON_AddNumberToObject(vid, "sceneHoldoff", cfg->video0.scene_holdoff);
+		cJSON_AddNumberToObject(vid, "sliceRows", cfg->video0.slice_rows);
 	}
 
 	/* outgoing */

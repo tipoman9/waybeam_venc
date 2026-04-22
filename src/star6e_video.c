@@ -25,18 +25,27 @@ typedef struct {
 	H26xParamSets *params;
 	size_t max_payload;
 	Star6eHevcRtpStats *stats;
+	int slices_enabled;
 } Star6eRtpFrameContext;
 
 static size_t send_frame_output_rtp(Star6eOutput *output,
 	const MI_VENC_Stream_t *stream, void *opaque)
 {
 	Star6eRtpFrameContext *ctx = opaque;
+	int end_of_frame = 1;
 
 	if (!ctx)
 		return 0;
 
+	if (ctx->slices_enabled && stream->count > 0 && stream->packet) {
+		const MI_VENC_Pack_t *last = &stream->packet[stream->count - 1];
+
+		end_of_frame = (last->endFrame != 0) ? 1 : 0;
+	}
+
 	return star6e_hevc_rtp_send_frame(stream, output, ctx->rtp,
-		ctx->frame_ticks, ctx->params, ctx->max_payload, ctx->stats);
+		ctx->frame_ticks, ctx->params, ctx->max_payload, ctx->stats,
+		end_of_frame);
 }
 
 void star6e_video_reset(Star6eVideoState *state)
@@ -58,6 +67,7 @@ void star6e_video_init(Star6eVideoState *state, const VencConfig *vcfg,
 	state->sensor_framerate = sensor_framerate;
 	state->max_frame_size = vcfg->outgoing.max_payload_size;
 	state->rtp_payload_size = vcfg->outgoing.max_payload_size;
+	state->slices_enabled = (vcfg->video0.slice_rows > 0) ? 1 : 0;
 
 	if (output && star6e_output_is_rtp(output)) {
 		RtpSessionState session;
@@ -101,6 +111,7 @@ size_t star6e_video_send_frame(Star6eVideoState *state,
 			.params = &state->param_sets,
 			.max_payload = state->rtp_payload_size,
 			.stats = verbose_enabled ? &frame_packetizer : NULL,
+			.slices_enabled = state->slices_enabled,
 		};
 
 		rtp_sidecar_poll(&state->sidecar);

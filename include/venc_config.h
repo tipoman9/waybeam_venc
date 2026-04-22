@@ -58,6 +58,7 @@ typedef struct {
 	bool frame_lost;           /* enable frame-lost safety net */
 	uint16_t scene_threshold;  /* frame size spike ratio x100 for scene IDR (0=off, 150=1.5x) */
 	uint8_t scene_holdoff;     /* consecutive frames above threshold to trigger */
+	int slice_rows;            /* macroblock rows per slice; 0 = disabled */
 } VencConfigVideo;
 
 typedef struct {

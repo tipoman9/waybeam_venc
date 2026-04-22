@@ -95,6 +95,9 @@ typedef struct {
 	int (*fnSetFrameLostStrategy)(int chn, void *p);
 	int (*fnGetFrameLostStrategy)(int chn, void *p);
 	int (*fnGetChnDevid)(int chn, uint32_t *dev_id);
+	/* Optional — NULL if the firmware does not export these symbols. */
+	int (*fnSetH265SliceSplit)(int chn, void *param);
+	int (*fnSetH264SliceSplit)(int chn, void *param);
 } star6e_venc_impl;
 
 /* Global instances — defined in star6e_mi.c.

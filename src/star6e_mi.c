@@ -307,6 +307,13 @@ static int i6e_venc_load(star6e_venc_impl *venc)
 		memset(venc, 0, sizeof(*venc));
 		return -1;
 	}
+
+	/* Optional slice-split symbols — absent on older firmware, not fatal. */
+	venc->fnSetH265SliceSplit = (int (*)(int, void *))
+		dlsym(venc->handle, "MI_VENC_SetH265SliceSplit");
+	venc->fnSetH264SliceSplit = (int (*)(int, void *))
+		dlsym(venc->handle, "MI_VENC_SetH264SliceSplit");
+
 	return 0;
 }
 
