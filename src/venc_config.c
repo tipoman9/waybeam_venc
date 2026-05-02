@@ -337,7 +337,8 @@ static void load_outgoing(const cJSON *root, VencConfigOutgoing *s)
 	s->sidecar_port = (uint16_t)json_get_int(obj, "sidecarPort",
 		(int)s->sidecar_port);
 	s->disable_packet_aggregation = json_get_bool(obj, "disablePacketAggregation",
-		s->disable_packet_aggregation);
+		json_get_bool(obj, "disable_packet_aggregation",
+		s->disable_packet_aggregation));
 }
 
 static void load_audio(const cJSON *root, VencConfigAudio *a)

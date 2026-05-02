@@ -137,3 +137,74 @@ gst-launch-1.0 -v \
 - The dual-stream ch1 (recording channel) always runs without slices.
 - The firmware `MI_VENC_SetH265SliceSplit` symbol may be absent on older
   builds; in that case slicing is silently disabled and full-frame mode is used.
+
+
+## Decode
+
+venc uses **PT=97 for H.265** (PT=96 is H.264). Use `payload=97` in all
+GStreamer caps. Using `payload=96` causes `rtph265depay` to silently discard
+every packet.
+
+With slices enabled, `rtph265depay` outputs `alignment=nal` (one buffer per
+NAL unit). The explicit caps filter between `rtph265depay` and `h265parse` is
+required so `h265parse` knows the input alignment; without it `h265parse` may
+stall waiting for a complete AU that never arrives.
+
+Add `rtpjitterbuffer latency=20 do-lost=true drop-on-latency=true` for fast
+recovery on packet loss (see loss recovery section above).
+
+### HW with slices (recommended)
+```
+gst-launch-1.0 udpsrc address=127.0.0.1 port=5600 buffer-size=65536 \
+  caps="application/x-rtp,encoding-name=H265,payload=97,clock-rate=90000" \
+! rtpjitterbuffer latency=20 do-lost=true drop-on-latency=true \
+! rtph265depay \
+! "video/x-h265,stream-format=byte-stream,alignment=nal" \
+! h265parse \
+! vah265dec \
+! autovideosink sync=false
+```
+
+### Software with slices
+```
+gst-launch-1.0 udpsrc address=127.0.0.1 port=5600 buffer-size=65536 \
+  caps="application/x-rtp,encoding-name=H265,payload=97,clock-rate=90000" \
+! rtpjitterbuffer latency=20 do-lost=true drop-on-latency=true \
+! rtph265depay \
+! "video/x-h265,stream-format=byte-stream,alignment=nal" \
+! h265parse \
+! avdec_h265 \
+! autovideosink sync=false
+```
+
+**Do not use `avdec_h265` expecting better error resilience.** FFmpeg error
+concealment tries to recover a missing slice by guessing motion vectors,
+producing a corrupted decoded frame that then becomes a reference for all
+subsequent P-frames. The artefacts spread and grow for the rest of the GOP
+(up to `gopSize` seconds). `vah265dec` refuses the incomplete AU and freezes
+that one frame, keeping the last good frame as reference — one glitch, then
+immediately clean.
+
+To limit the corruption window from packet loss, reduce `gopSize` on the
+encoder (shorter IDR interval):
+
+```bash
+ssh root@<HOST> "json_cli -s .video0.gopSize 0.5 -i /etc/venc.json"
+```
+
+| gopSize | Max corruption window | Bitrate impact |
+|---------|----------------------|----------------|
+| 1.0 s   | ~60 frames @ 60 fps  | baseline       |
+| 0.5 s   | ~30 frames           | +5–8 %         |
+| 0.25 s  | ~15 frames           | +12–18 %       |
+| 0.1 s   | ~6 frames            | +25–40 %       |
+
+0.25–0.5 s is a typical FPV sweet spot.
+
+### HW without slices (sliceRows=0)
+```
+gst-launch-1.0 udpsrc address=127.0.0.1 port=5600 buffer-size=65536 \
+  caps="application/x-rtp,encoding-name=H265,payload=97,clock-rate=90000" \
+! rtph265depay ! h265parse ! vah265dec \
+! autovideosink sync=false
+```
