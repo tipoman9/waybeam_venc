@@ -26,7 +26,8 @@
     "frameLost": true,
     "sceneThreshold": 0,
     "sceneHoldoff": 2,
-    "sliceRows": 0
+    "sliceRows": 0,
+    "perSliceAu": false
   },
   "outgoing": {
     "enabled": false,
@@ -35,7 +36,8 @@
     "maxPayloadSize": 1400,
     "connectedUdp": true,
     "audioPort": 5601,
-    "sidecarPort": 5602
+    "sidecarPort": 5602,
+    "disablePacketAggregation": false
   },
   "fpv": { "roiEnabled": true, "roiQp": 0, "roiSteps": 2, "roiCenter": 0.4, "noiseLevel": 0 },
   "audio": {

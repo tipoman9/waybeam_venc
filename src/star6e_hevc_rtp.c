@@ -224,13 +224,43 @@ static size_t send_prepend_param_sets_hevc(const H26xParamSets *params,
 	return total_bytes;
 }
 
+/* Returns 1 if the H.265 NAL type is a VCL (slice) NAL. */
+static int hevc_is_vcl(uint8_t nal_type)
+{
+	return nal_type <= 31;
+}
+
+/* Send stored VPS/SPS/PPS unconditionally (used in per-slice-AU mode). */
+static size_t send_param_sets_hevc(const H26xParamSets *params,
+	Star6eOutput *output, RtpPacketizerState *rtp,
+	size_t max_payload, Star6eHevcRtpStats *stats)
+{
+	size_t total = 0;
+
+	if (!params || !rtp)
+		return 0;
+
+	if (params->vps_len)
+		total += send_nal_rtp_hevc(params->vps, params->vps_len,
+			output, rtp, 0, max_payload, stats);
+	if (params->sps_len)
+		total += send_nal_rtp_hevc(params->sps, params->sps_len,
+			output, rtp, 0, max_payload, stats);
+	if (params->pps_len)
+		total += send_nal_rtp_hevc(params->pps, params->pps_len,
+			output, rtp, 0, max_payload, stats);
+	return total;
+}
+
 size_t star6e_hevc_rtp_send_frame(const MI_VENC_Stream_t *stream,
 	Star6eOutput *output, RtpPacketizerState *rtp,
-	uint32_t frame_ticks, H26xParamSets *params, size_t max_payload,
-	Star6eHevcRtpStats *stats, int end_of_frame, int no_aggregation)
+	uint32_t frame_ticks, uint32_t slice_ticks, H26xParamSets *params,
+	size_t max_payload, Star6eHevcRtpStats *stats, int end_of_frame,
+	int no_aggregation, int per_slice_au)
 {
 	size_t total_bytes = 0;
 	HevcApBuilder ap;
+	uint32_t frame_start_ts;
 
 	if (!stream || !output || !rtp)
 		return 0;
@@ -238,6 +268,7 @@ size_t star6e_hevc_rtp_send_frame(const MI_VENC_Stream_t *stream,
 	if (max_payload > RTP_BUFFER_MAX)
 		max_payload = RTP_BUFFER_MAX;
 
+	frame_start_ts = rtp->timestamp;
 	hevc_ap_reset(&ap);
 
 	for (unsigned int i = 0; i < stream->count; ++i) {
@@ -293,6 +324,18 @@ size_t star6e_hevc_rtp_send_frame(const MI_VENC_Stream_t *stream,
 			if (params)
 				h26x_param_sets_update(params, PT_H265, nal_type, nal_ptr, nal_len);
 
+			if (per_slice_au && hevc_is_vcl(nal_type)) {
+				/* Each slice is its own AU: VPS/SPS/PPS prefix, marker,
+				 * fractional timestamp advance. */
+				if (params)
+					total_bytes += send_param_sets_hevc(params, output,
+						rtp, max_payload, stats);
+				total_bytes += send_nal_rtp_hevc(nal_ptr, nal_len, output,
+					rtp, 1, max_payload, stats);
+				rtp->timestamp += slice_ticks;
+				continue;
+			}
+
 			last_nal = end_of_frame &&
 				(i == stream->count - 1) &&
 				((pack->packNum > 0 && k == nal_count - 1) ||
@@ -309,7 +352,16 @@ size_t star6e_hevc_rtp_send_frame(const MI_VENC_Stream_t *stream,
 	}
 
 	total_bytes += hevc_ap_flush(&ap, output, rtp, end_of_frame, stats);
-	if (end_of_frame)
-		rtp->timestamp += frame_ticks;
+	if (end_of_frame) {
+		if (per_slice_au)
+			/* Snap to the next exact frame boundary so that integer-division
+			 * remainder (frame_ticks % num_slices) does not accumulate as
+			 * drift across frames.  Without this, every frame starts 4 ticks
+			 * early (1500 - 17*88 = 4) and the reassembler misclassifies
+			 * the first slice after ~8 frames. */
+			rtp->timestamp = frame_start_ts + frame_ticks;
+		else
+			rtp->timestamp += frame_ticks;
+	}
 	return total_bytes;
 }

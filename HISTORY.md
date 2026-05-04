@@ -1,5 +1,49 @@
 # History
 
+## [0.8.1] - 2026-05-03
+
+- **Fix: per-slice AU timestamp drift (star6e):** In `perSliceAu` mode the
+  encoder now snaps `rtp->timestamp = frame_start_ts + frame_ticks` at the end
+  of each frame.  Previously the accumulated `+slice_ticks` increments fell
+  4 ticks short per frame (1500 - 17×88 = 4), causing the first slice of each
+  subsequent frame to arrive 4·N ticks early.  After ~8 frames the drift pushed
+  the first slice into the wrong fidx in the reassembler, appearing as
+  "first slice lost" for every frame from that point on.
+- **Fix: reassembler flush timing for WFB-NG links:** The arrival-triggered
+  flush (`_flush_stale`) is removed.  WFB-NG FEC delivers packets from multiple
+  frames simultaneously over a ~300 ms window; triggering a flush on the first
+  packet from a later frame discarded still-arriving slices.  The reassembler
+  now flushes only via the 400 ms idle timeout, which exceeds the observed
+  per-frame delivery spread.
+
+## [0.8.0] - 2026-05-03
+
+- **H.265 slice split (star6e):** `sliceRows` config field splits each encoded
+  frame into independent slice NALs via `MI_VENC_SetH265SliceSplit`.  Reduces
+  latency at the cost of slight compression overhead.  Symbol is loaded via
+  optional `dlsym`; silently disabled if absent on older firmware.
+- **Per-slice AU RTP framing (star6e):** `perSliceAu` config field sends each
+  H.265 slice as its own RTP access unit with a VPS/SPS/PPS prefix, marker bit,
+  and fractional timestamp advance (`slice_ticks = frame_ticks / num_slices`).
+  Enables per-row-band packet-loss isolation at the receiver.  Timestamp step
+  is pre-computed from `height` and `sliceRows` at init time; not inferred from
+  per-callback NAL counts (which would be wrong because the SDK delivers one
+  slice per callback).
+- **RTP packet aggregation control:** `disablePacketAggregation` outgoing option
+  prevents the AP (Aggregation Packet) builder from bundling multiple NALs into
+  one RTP packet.  Required for `perSliceAu` mode.
+- **WFB-TX integration:** Embedded wfb-ng TX module (`src/wfbtx/`).  Encoder
+  output can be forwarded directly to a WFB-NG transmitter via
+  `outgoing.server = "wfb://..."`.  Per-second TX timing metrics added.
+- **Per-slice AU reassembler tool:** `tools/hevc_slice_reassembler.py` receives
+  the per-slice AU stream, groups slices by frame using RTP timestamp arithmetic,
+  and feeds assembled H.265 Annex-B AUs to a GStreamer `appsrc → h265parse →
+  vah265dec` pipeline.  A lost slice causes only the affected row-band to be
+  frozen; other rows decode normally.
+- **RTP slice diagnostic tool:** `tools/rtp_slice_check.py` captures a UDP RTP
+  stream, groups packets by SSRC and timestamp, and reports packets-per-frame
+  distribution, marker-bit compliance, and slice confirmation.
+
 ## [0.7.0] - 2026-04-11
 
 - **dlopen migration (both backends):** Both Star6E and Maruko now load all

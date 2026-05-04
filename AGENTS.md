@@ -446,6 +446,8 @@ Read these before working on related areas:
 | Crash log / incidents | `documentation/CRASH_LOG.md` |
 | Target agent design (future) | `documentation/TARGET_AGENT_ARCHITECTURE.md` |
 | SD card recording | `documentation/SD_CARD_RECORDING.md` |
+| H.265 slice split + per-slice AU | `documentation/SLICES.md` |
+| Per-slice AU reassembler (receiver) | `documentation/REASSEMBLER.md` |
 | WFB-NG TX embedded integration | `documentation/WFB_TX_INTEGRATION.md` |
 | Coding conventions | `documentation/CONVENTIONS.md` |
 | Code structure prestudy | `documentation/CODE_STRUCTURE_PRESTUDY.md` |

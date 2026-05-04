@@ -22,11 +22,13 @@ static uint64_t monotonic_us(void)
 typedef struct {
 	RtpPacketizerState *rtp;
 	uint32_t frame_ticks;
+	uint32_t slice_ticks;
 	H26xParamSets *params;
 	size_t max_payload;
 	Star6eHevcRtpStats *stats;
 	int slices_enabled;
 	int no_aggregation;
+	int per_slice_au;
 } Star6eRtpFrameContext;
 
 static size_t send_frame_output_rtp(Star6eOutput *output,
@@ -45,8 +47,8 @@ static size_t send_frame_output_rtp(Star6eOutput *output,
 	}
 
 	return star6e_hevc_rtp_send_frame(stream, output, ctx->rtp,
-		ctx->frame_ticks, ctx->params, ctx->max_payload, ctx->stats,
-		end_of_frame, ctx->no_aggregation);
+		ctx->frame_ticks, ctx->slice_ticks, ctx->params, ctx->max_payload,
+		ctx->stats, end_of_frame, ctx->no_aggregation, ctx->per_slice_au);
 }
 
 void star6e_video_reset(Star6eVideoState *state)
@@ -70,6 +72,7 @@ void star6e_video_init(Star6eVideoState *state, const VencConfig *vcfg,
 	state->rtp_payload_size = vcfg->outgoing.max_payload_size;
 	state->slices_enabled = (vcfg->video0.slice_rows > 0) ? 1 : 0;
 	state->no_aggregation = vcfg->outgoing.disable_packet_aggregation ? 1 : 0;
+	state->per_slice_au = vcfg->video0.per_slice_au ? 1 : 0;
 
 	if (output && star6e_output_is_rtp(output)) {
 		RtpSessionState session;
@@ -81,6 +84,16 @@ void star6e_video_init(Star6eVideoState *state, const VencConfig *vcfg,
 		state->rtp_state.ssrc = session.ssrc;
 		state->rtp_state.payload_type = session.payload_type;
 		state->rtp_frame_ticks = session.frame_ticks;
+	}
+
+	state->per_slice_au_ticks = state->rtp_frame_ticks;
+	if (state->per_slice_au && vcfg->video0.slice_rows > 0 &&
+	    vcfg->video0.height > 0) {
+		uint32_t mb_rows = (vcfg->video0.height + 15) / 16;
+		uint32_t num_slices = (mb_rows + (uint32_t)vcfg->video0.slice_rows - 1)
+		                      / (uint32_t)vcfg->video0.slice_rows;
+		if (num_slices > 1)
+			state->per_slice_au_ticks = state->rtp_frame_ticks / num_slices;
 	}
 
 	if (vcfg->system.verbose) {
@@ -110,11 +123,13 @@ size_t star6e_video_send_frame(Star6eVideoState *state,
 		Star6eRtpFrameContext rtp_frame = {
 			.rtp = &state->rtp_state,
 			.frame_ticks = state->rtp_frame_ticks,
+			.slice_ticks = state->per_slice_au_ticks,
 			.params = &state->param_sets,
 			.max_payload = state->rtp_payload_size,
 			.stats = verbose_enabled ? &frame_packetizer : NULL,
 			.slices_enabled = state->slices_enabled,
 			.no_aggregation = state->no_aggregation,
+			.per_slice_au   = state->per_slice_au,
 		};
 
 		rtp_sidecar_poll(&state->sidecar);

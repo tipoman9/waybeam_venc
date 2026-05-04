@@ -639,10 +639,17 @@ static int star6e_pipeline_start_venc(uint32_t width, uint32_t height,
 			.u32SliceRowCount = (uint32_t)slice_rows,
 		};
 
-		if (codec == PT_H265 && g_mi_venc.fnSetH265SliceSplit)
-			g_mi_venc.fnSetH265SliceSplit(*chn, &sp);
-		else if (codec != PT_H265 && g_mi_venc.fnSetH264SliceSplit)
-			g_mi_venc.fnSetH264SliceSplit(*chn, &sp);
+		if (codec == PT_H265 && g_mi_venc.fnSetH265SliceSplit) {
+			int sret = g_mi_venc.fnSetH265SliceSplit(*chn, &sp);
+			if (sret != 0)
+				fprintf(stderr, "WARN: MI_VENC_SetH265SliceSplit failed %d\n", sret);
+		} else if (codec == PT_H265) {
+			fprintf(stderr, "WARN: MI_VENC_SetH265SliceSplit not available\n");
+		} else if (g_mi_venc.fnSetH264SliceSplit) {
+			int sret = g_mi_venc.fnSetH264SliceSplit(*chn, &sp);
+			if (sret != 0)
+				fprintf(stderr, "WARN: MI_VENC_SetH264SliceSplit failed %d\n", sret);
+		}
 	}
 
 	ret = MI_VENC_StartRecvPic(*chn);

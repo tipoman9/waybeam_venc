@@ -226,6 +226,7 @@ static const FieldDesc g_fields[] = {
 	FIELD(video0, scene_threshold,  FT_UINT16, MUT_RESTART),
 	FIELD(video0, scene_holdoff,   FT_UINT8,  MUT_RESTART),
 	FIELD(video0, slice_rows,      FT_INT,    MUT_RESTART),
+	FIELD(video0, per_slice_au,    FT_BOOL,   MUT_RESTART),
 	FIELD(debug,  show_osd,    FT_BOOL,   MUT_RESTART),
 };
 
@@ -292,6 +293,7 @@ static const FieldAlias g_field_aliases[] = {
 	{ "video0.sceneThreshold", "video0.scene_threshold" },
 	{ "video0.sceneHoldoff", "video0.scene_holdoff" },
 	{ "video0.sliceRows", "video0.slice_rows" },
+	{ "video0.perSliceAu", "video0.per_slice_au" },
 	{ "outgoing.sidecarPort", "outgoing.sidecar_port" },
 	{ "outgoing.connectedUdp",             "outgoing.connected_udp" },
 	{ "outgoing.disablePacketAggregation", "outgoing.disable_packet_aggregation" },

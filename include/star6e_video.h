@@ -16,6 +16,7 @@
 typedef struct {
 	RtpPacketizerState rtp_state;
 	uint32_t rtp_frame_ticks;
+	uint32_t per_slice_au_ticks;
 	H26xParamSets param_sets;
 	uint32_t sensor_framerate;
 	uint16_t max_frame_size;
@@ -23,6 +24,7 @@ typedef struct {
 	unsigned int frame_counter;
 	int slices_enabled;
 	int no_aggregation;
+	int per_slice_au;
 	StreamMetricsState verbose_metrics;
 	Star6eHevcRtpStats verbose_packetizer_interval;
 	RtpSidecarSender sidecar;
