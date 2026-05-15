@@ -107,6 +107,7 @@ Response `200`:
       "outgoing": { "enabled": true, "server": "udp://192.168.2.20:5600", "streamMode": "rtp", "maxPayloadSize": 1400, "connectedUdp": false },
       "fpv": { "roiEnabled": true, "roiQp": 0, "roiSteps": 2, "roiCenter": 0.25, "noiseLevel": 0 },
       "record": { "enabled": false, "mode": "off", "dir": "/tmp/sdcard", "format": "ts", "maxSeconds": 300, "maxMB": 500 },
+      "optflow": { "enabled": false, "mode": "lk", "showOSD": true, "verbose": false, "fps": 5 },
       "debug": { "showOsd": false }
     },
     "runtime": {

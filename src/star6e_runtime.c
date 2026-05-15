@@ -3,6 +3,7 @@
 #include "audio_codec.h"
 #include "debug_osd.h"
 #include "idr_rate_limit.h"
+#include "opt_flow.h"
 #include "imu_bmi270.h"
 #include "pipeline_common.h"
 #include "scene_detector.h"
@@ -839,6 +840,8 @@ static int star6e_runtime_process_stream(Star6eRunnerContext *ctx,
 		return ret;
 	}
 
+	optflow_on_stream(ps->optflow, stream.count);
+
 	{
 		RtpSidecarEncInfo enc_info;
 		int codec = (strcmp(vcfg->video0.codec, "h264") == 0) ? 0 : 1;
@@ -956,60 +959,64 @@ static int star6e_runtime_process_stream(Star6eRunnerContext *ctx,
 		}
 	}
 
-	/* Debug OSD overlay */
+	/* OSD overlay — one begin/end frame shared by debug text and optflow */
 	if (ps->debug_osd) {
-		static unsigned int osd_prev_frame;
-		static struct timespec osd_prev_ts;
-		static unsigned int osd_fps;
-		struct timespec osd_now;
-
 		debug_osd_begin_frame(ps->debug_osd);
-		debug_osd_sample_cpu(ps->debug_osd);
 
-		/* Compute fps from frame counter delta */
-		clock_gettime(CLOCK_MONOTONIC, &osd_now);
-		long osd_ms = (osd_now.tv_sec - osd_prev_ts.tv_sec) * 1000 +
-			(osd_now.tv_nsec - osd_prev_ts.tv_nsec) / 1000000;
-		if (osd_ms >= 1000) {
-			unsigned int df = ps->video.frame_counter - osd_prev_frame;
-			osd_fps = (unsigned int)(df * 1000 / (unsigned long)osd_ms);
-			osd_prev_frame = ps->video.frame_counter;
-			osd_prev_ts = osd_now;
-		}
+		if (vcfg->debug.show_osd) {
+			static unsigned int osd_prev_frame;
+			static struct timespec osd_prev_ts;
+			static unsigned int osd_fps;
+			struct timespec osd_now;
 
-		debug_osd_text(ps->debug_osd, 0, "fps", "%u", osd_fps);
-		debug_osd_text(ps->debug_osd, 1, "cpu", "%d%%",
-			debug_osd_get_cpu(ps->debug_osd));
+			debug_osd_sample_cpu(ps->debug_osd);
 
-		{
-			int osd_row = 2;
-			Star6eIntraRefreshStatus ir;
-			star6e_pipeline_intra_refresh_status(&ir);
-			if (ir.active) {
-				debug_osd_text(ps->debug_osd, osd_row++, "intra",
-					"%s L%u q%u",
-					ir.mode_name, ir.effective_lines_per_p,
-					ir.effective_qp);
-				debug_osd_text(ps->debug_osd, osd_row++, "gop",
-					"%.2fs %s",
-					ir.effective_gop_sec,
-					ir.gop_auto ? "auto" : "fixed");
+			clock_gettime(CLOCK_MONOTONIC, &osd_now);
+			long osd_ms = (osd_now.tv_sec - osd_prev_ts.tv_sec) * 1000 +
+				(osd_now.tv_nsec - osd_prev_ts.tv_nsec) / 1000000;
+			if (osd_ms >= 1000) {
+				unsigned int df = ps->video.frame_counter - osd_prev_frame;
+				osd_fps = (unsigned int)(df * 1000 / (unsigned long)osd_ms);
+				osd_prev_frame = ps->video.frame_counter;
+				osd_prev_ts = osd_now;
 			}
 
-			Star6eZoomStatus zoom;
-			star6e_pipeline_zoom_status(&zoom);
-			if (zoom.active) {
-				debug_osd_text(ps->debug_osd, osd_row++, "zoom",
-					"%u.%02ux %ux%u",
-					zoom.level_x100 / 100,
-					zoom.level_x100 % 100,
-					zoom.output_w, zoom.output_h);
-				debug_osd_text(ps->debug_osd, osd_row++, "crop",
-					"%ux%u+%u+%u",
-					zoom.crop_w, zoom.crop_h,
-					zoom.crop_x, zoom.crop_y);
+			debug_osd_text(ps->debug_osd, 0, "fps", "%u", osd_fps);
+			debug_osd_text(ps->debug_osd, 1, "cpu", "%d%%",
+				debug_osd_get_cpu(ps->debug_osd));
+
+			{
+				int osd_row = 2;
+				Star6eIntraRefreshStatus ir;
+				star6e_pipeline_intra_refresh_status(&ir);
+				if (ir.active) {
+					debug_osd_text(ps->debug_osd, osd_row++, "intra",
+						"%s L%u q%u",
+						ir.mode_name, ir.effective_lines_per_p,
+						ir.effective_qp);
+					debug_osd_text(ps->debug_osd, osd_row++, "gop",
+						"%.2fs %s",
+						ir.effective_gop_sec,
+						ir.gop_auto ? "auto" : "fixed");
+				}
+
+				Star6eZoomStatus zoom;
+				star6e_pipeline_zoom_status(&zoom);
+				if (zoom.active) {
+					debug_osd_text(ps->debug_osd, osd_row++, "zoom",
+						"%u.%02ux %ux%u",
+						zoom.level_x100 / 100,
+						zoom.level_x100 % 100,
+						zoom.output_w, zoom.output_h);
+					debug_osd_text(ps->debug_osd, osd_row++, "crop",
+						"%ux%u+%u+%u",
+						zoom.crop_w, zoom.crop_h,
+						zoom.crop_x, zoom.crop_y);
+				}
 			}
 		}
+
+		optflow_draw_osd(ps->optflow);
 
 		debug_osd_end_frame(ps->debug_osd);
 	}

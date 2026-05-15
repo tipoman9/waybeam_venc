@@ -17,6 +17,7 @@
 #include <time.h>
 
 struct DebugOsdState; /* forward declaration — see debug_osd.h */
+struct OptFlowState;  /* forward declaration — see opt_flow.h */
 
 typedef struct {
 	uint16_t x;
@@ -55,6 +56,7 @@ typedef struct {
 	Star6eTsRecorderState ts_recorder;
 	AudioRing audio_ring;
 	ImuState *imu;              /* NULL if IMU disabled */
+	struct OptFlowState *optflow; /* NULL if optical flow disabled */
 	MI_VENC_Pack_t *stream_packs;     /* pre-allocated for main loop */
 	uint32_t stream_packs_cap;
 	/* Dual VENC (gemini mode) — heap-allocated, NULL when inactive */

@@ -26,10 +26,9 @@ This folder is the canonical place for waybeam_venc project documentation.
 - `documentation/DEBUG_OSD_PLAN.md`
   - Debug OSD overlay API reference. Covers enabling, drawing primitives (text,
     rect, point, line), color constants, and how to add debug output from new modules.
-- `documentation/OPTFLOW_FUSION_ROADMAP.md`
-  - Optical flow + IMU fusion implementation roadmap.
-  - Covers derotation, flight controller integration (MAVLink/MSP), degraded modes,
-    performance budget, and phased implementation plan.
+- `documentation/OPTICAL_FLOW.md`
+  - Technical description of the current Star6E optflow pipeline.
+  - Covers post-frame-retrieval processing, ROI extraction, and planar `tx`/`ty`/`tz` estimation.
 - `documentation/REMOTE_TEST_WORKFLOW.md`
   - Bounded remote CLI/test-binary workflow, cold-state rules, and hang handling.
 - `documentation/CRASH_LOG.md`

@@ -91,6 +91,13 @@
     "gopSize": 0.0,
     "server": ""
   },
+  "optflow": {
+    "enabled": false,
+    "mode": "lk",
+    "showOSD": true,
+    "verbose": false,
+    "fps": 5
+  },
   "debug": {
     "showOsd": false
   }

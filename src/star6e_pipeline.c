@@ -1,5 +1,6 @@
 #include "star6e_pipeline.h"
 
+#include "opt_flow.h"
 #include "codec_config.h"
 #include "codec_types.h"
 #include "debug_osd.h"
@@ -1492,12 +1493,30 @@ static int bind_and_finalize_pipeline(Star6ePipelineState *state,
 
 	/* Debug OSD.  Canvas dim is the encoded frame dim; on Star6E RGN
 	 * attaches at the VPE port output (post-SCL crop), so the canvas is
-	 * already 1:1 with the encoded frame and needs no zoom-time offset. */
-	if (vcfg->debug.show_osd) {
+	 * already 1:1 with the encoded frame and needs no zoom-time offset.
+	 * A single DebugOsdState is shared by the debug text overlay and the
+	 * optflow overlay — MI_RGN supports only one region per handle, so
+	 * both drawing paths use the same canvas. */
+	if ((vcfg->debug.show_osd || vcfg->optflow.show_osd) && !state->debug_osd) {
 		state->debug_osd = debug_osd_create(
 			state->image_width, state->image_height, &state->vpe_port);
 		if (!state->debug_osd)
-			fprintf(stderr, "WARNING: debug OSD requested but MI_RGN unavailable\n");
+			fprintf(stderr, "WARNING: OSD requested but MI_RGN unavailable\n");
+	}
+
+	if (vcfg->optflow.enabled && !state->optflow) {
+		state->optflow = optflow_create(state->image_width,
+			state->image_height,
+			state->image_width,
+			state->image_height,
+			vcfg->optflow.verbose ? 1 : 0,
+			vcfg->optflow.fps,
+			vcfg->optflow.mode,
+			&state->vpe_port,
+			vcfg->optflow.show_osd ? state->debug_osd : NULL);
+		if (!state->optflow) {
+			fprintf(stderr, "WARNING: OptFlow init failed, continuing without motion tracking\n");
+		}
 	}
 
 	return 0;
@@ -1587,6 +1606,10 @@ void star6e_pipeline_stop(Star6ePipelineState *state)
 	 * removed; see HISTORY 0.8.0) so order vs other teardown steps
 	 * doesn't matter, but keeping the stop-then-destroy split lets a
 	 * future telemetry consumer slot in without rework. */
+	if (state->optflow) {
+		optflow_destroy(state->optflow);
+		state->optflow = NULL;
+	}
 	if (state->imu) {
 		imu_stop(state->imu);
 		imu_destroy(state->imu);
@@ -1672,6 +1695,279 @@ void star6e_pipeline_stop(Star6ePipelineState *state)
 	star6e_pipeline_stop_sensor(state->sensor.pad_id);
 }
 
+/* Partial teardown for SIGHUP reinit: tears down VENC channels, binds,
+ * output, audio, IMU/OptFlow but keeps sensor/VIF/VPE running.  The SigmaStar
+ * MIPI PHY does not recover from MI_SNR_Disable/Enable cycles, so the
+ * sensor must stay active across reinit. */
+static void star6e_pipeline_stop_venc_level(Star6ePipelineState *state)
+{
+	if (!state)
+		return;
+
+	if (state->imu)
+		imu_stop(state->imu);
+	if (state->optflow) {
+		optflow_destroy(state->optflow);
+		state->optflow = NULL;
+	}
+	if (state->imu) {
+		imu_destroy(state->imu);
+		state->imu = NULL;
+	}
+
+	star6e_audio_teardown(&state->audio);
+	star6e_output_teardown(&state->output);
+	if (state->dual)
+		star6e_output_teardown(&state->dual->output);
+
+	if (state->dual && state->dual->rec_started) {
+		state->dual->rec_running = 0;
+		pthread_join(state->dual->rec_thread, NULL);
+		state->dual->rec_started = 0;
+	}
+
+	if (state->dual && state->dual->bound) {
+		MI_SYS_UnBindChnPort(&state->vpe_port, &state->dual->port);
+		state->dual->bound = 0;
+	}
+	if (state->bound_vpe_venc) {
+		MI_SYS_UnBindChnPort(&state->vpe_port, &state->venc_port);
+		state->bound_vpe_venc = 0;
+	}
+
+	drain_venc_channel(state->venc_channel, 500, "ch0");
+	if (state->dual)
+		drain_venc_channel(state->dual->channel, 500, "ch1-post");
+
+	if (state->dual)
+		MI_VENC_StopRecvPic(state->dual->channel);
+	MI_VENC_StopRecvPic(state->venc_channel);
+
+	/* VIF→VPE bind stays active — do NOT unbind */
+
+	if (state->dual) {
+		venc_api_dual_unregister();
+		MI_VENC_DestroyChn(state->dual->channel);
+		free(state->dual->stream_packs);
+		free(state->dual);
+		state->dual = NULL;
+	}
+	MI_VENC_DestroyChn(state->venc_channel);
+
+	/* Reset VENC-level state but preserve sensor/VIF/VPE state */
+	star6e_output_reset(&state->output);
+	star6e_video_reset(&state->video);
+}
+
+/* flatten: same rationale as star6e_pipeline_start — when this function gains
+ * a call to star6e_pipeline_start_vpe (on aspect-ratio resize), GCC -Os would
+ * de-inline it, changing the stack layout for MI_VPE_CreateChannel and breaking
+ * ISP channel creation.  flatten keeps all static callees inlined here too. */
+__attribute__((flatten))
+int star6e_pipeline_reinit(Star6ePipelineState *state, const VencConfig *vcfg,
+	SdkQuietState *sdk_quiet)
+{
+	Star6ePipelineConfig pconf;
+	uint32_t venc_fps;
+	uint32_t prev_image_width;
+	uint32_t prev_image_height;
+	int ret;
+
+	if (!state || !vcfg)
+		return -1;
+
+	star6e_pipeline_stop_venc_level(state);
+
+	if (prepare_pipeline_config(state, vcfg, &pconf) != 0)
+		return -1;
+
+	/* Reuse existing sensor state — don't call sensor_select.
+	 * Recompute image dimensions from the existing sensor mode. */
+	pconf.sensor_framerate = state->sensor.fps;
+	pconf.venc_gop_size = pipeline_common_gop_frames(vcfg->video0.gop_size,
+		pconf.sensor_framerate);
+
+	/* Capture current dimensions before clamping overwrites state. */
+	prev_image_width  = state->image_width;
+	prev_image_height = state->image_height;
+
+	pipeline_common_clamp_image_size("",
+		state->sensor.plane.capt.width,
+		state->sensor.plane.capt.height,
+		&pconf.image_width, &pconf.image_height);
+	state->image_width  = pconf.image_width;
+	state->image_height = pconf.image_height;
+
+	if (pconf.image_width != prev_image_width ||
+	    pconf.image_height != prev_image_height) {
+		uint32_t sensor_w = state->sensor.plane.capt.width;
+		uint32_t sensor_h = state->sensor.plane.capt.height;
+
+		/* Use usable sensor dimensions for precrop (same logic as
+		 * select_and_configure_sensor): sensors with MIPI overscan report
+		 * a larger plane.capt than the usable mode.output area. */
+		uint32_t usable_w = sensor_w;
+		uint32_t usable_h = sensor_h;
+		if (state->sensor.mode.output.width > 0 &&
+		    state->sensor.mode.output.height > 0) {
+			if (state->sensor.mode.output.width < usable_w)
+				usable_w = state->sensor.mode.output.width;
+			if (state->sensor.mode.output.height < usable_h)
+				usable_h = state->sensor.mode.output.height;
+		}
+		uint16_t overscan_x = (uint16_t)(
+			((sensor_w - usable_w) / 2) & ~1u);
+		uint16_t overscan_y = (uint16_t)(
+			((sensor_h - usable_h) / 2) & ~1u);
+
+		Star6ePrecropRect old_precrop = star6e_pipeline_compute_precrop(
+			usable_w, usable_h, prev_image_width, prev_image_height,
+			vcfg->isp.keep_aspect);
+		old_precrop.x += overscan_x;
+		old_precrop.y += overscan_y;
+		Star6ePrecropRect new_precrop = star6e_pipeline_compute_precrop(
+			usable_w, usable_h, pconf.image_width, pconf.image_height,
+			vcfg->isp.keep_aspect);
+		new_precrop.x += overscan_x;
+		new_precrop.y += overscan_y;
+
+		if (old_precrop.x != new_precrop.x ||
+		    old_precrop.y != new_precrop.y ||
+		    old_precrop.w != new_precrop.w ||
+		    old_precrop.h != new_precrop.h) {
+			/* Aspect ratio changed: unbind VIF→VPE, destroy VPE, reconfigure
+			 * VIF capture region, recreate VPE with new dimensions.
+			 * The VIF device stays running — MIPI PHY is never touched.
+			 * bound_vif_vpe is cleared so bind_and_finalize_pipeline will
+			 * re-establish the VIF→VPE REALTIME bind. */
+			printf("> Reinit: AR change %ux%u -> %ux%u, reconfiguring VIF+VPE\n",
+				prev_image_width, prev_image_height,
+				pconf.image_width, pconf.image_height);
+
+			if (state->bound_vif_vpe) {
+				MI_SYS_UnBindChnPort(&state->vif_port,
+					&state->vpe_port);
+				state->bound_vif_vpe = 0;
+			}
+
+			star6e_pipeline_stop_vpe();
+
+			/* Reconfigure VIF port crop (device stays enabled). */
+			MI_VIF_PortAttr_t vif_port = {0};
+			vif_port.capt.x      = state->sensor.plane.capt.x +
+				new_precrop.x;
+			vif_port.capt.y      = state->sensor.plane.capt.y +
+				new_precrop.y;
+			vif_port.capt.width  = new_precrop.w;
+			vif_port.capt.height = new_precrop.h;
+			vif_port.dest.width  = new_precrop.w;
+			vif_port.dest.height = new_precrop.h;
+			vif_port.field       = 0;
+			vif_port.interlaceOn = 0;
+			if (state->sensor.plane.bayer > I6_BAYER_END) {
+				vif_port.pixFmt = state->sensor.plane.pixFmt;
+			} else {
+				vif_port.pixFmt = (i6_common_pixfmt)(
+					I6_PIXFMT_RGB_BAYER +
+					state->sensor.plane.precision *
+					I6_BAYER_END +
+					state->sensor.plane.bayer);
+			}
+			vif_port.frate        = I6_VIF_FRATE_FULL;
+			vif_port.frameLineCnt = 0;
+
+			MI_VIF_DisableChnPort(0, 0);
+			ret = MI_VIF_SetChnPortAttr(0, 0, &vif_port);
+			if (ret != 0) {
+				fprintf(stderr,
+					"ERROR: MI_VIF_SetChnPortAttr reinit"
+					" failed %d\n", ret);
+				/* VPE is destroyed; fully stop VIF for clean
+				 * state before the caller recovers or exits. */
+				MI_VIF_DisableDev(0);
+				return ret;
+			}
+			ret = MI_VIF_EnableChnPort(0, 0);
+			if (ret != 0) {
+				fprintf(stderr,
+					"ERROR: MI_VIF_EnableChnPort reinit"
+					" failed %d\n", ret);
+				MI_VIF_DisableDev(0);
+				return ret;
+			}
+
+			/* Recreate VPE with new input crop and output dimensions. */
+			pconf.precrop = new_precrop;
+			ret = star6e_pipeline_start_vpe(&state->sensor,
+				&new_precrop,
+				pconf.image_width, pconf.image_height,
+				pconf.image_mirror, pconf.image_flip,
+				pconf.vpe_level_3dnr, sdk_quiet);
+			if (ret != 0) {
+				/* VIF is enabled with new crop but VPE failed;
+				 * disable VIF to leave pipeline in consistent
+				 * stopped state. */
+				MI_VIF_DisableChnPort(0, 0);
+				MI_VIF_DisableDev(0);
+				return ret;
+			}
+
+		} else {
+			/* Same aspect ratio: only resize VPE output port.
+			 * VIF and the VIF→VPE REALTIME bind are unchanged. */
+			printf("> Reinit: resolution change %ux%u -> %ux%u,"
+				" resizing VPE port\n",
+				prev_image_width, prev_image_height,
+				pconf.image_width, pconf.image_height);
+
+			MI_VPE_PortAttr_t vpe_port = {0};
+			vpe_port.output.width  = pconf.image_width;
+			vpe_port.output.height = pconf.image_height;
+			vpe_port.pixFmt        = I6_PIXFMT_YUV420SP;
+			vpe_port.compress      = I6_COMPR_NONE;
+
+			MI_VPE_DisablePort(0, 0);
+			ret = MI_VPE_SetPortMode(0, 0, &vpe_port);
+			if (ret != 0) {
+				fprintf(stderr,
+					"ERROR: MI_VPE_SetPortMode(%ux%u)"
+					" failed %d\n",
+					pconf.image_width, pconf.image_height,
+					ret);
+				/* Restore port enable so VPE remains usable
+				 * at the previous output dimensions. */
+				MI_VPE_EnablePort(0, 0);
+				return ret;
+			}
+			ret = MI_VPE_EnablePort(0, 0);
+			if (ret != 0) {
+				fprintf(stderr,
+					"ERROR: MI_VPE_EnablePort after"
+					" resize failed %d\n", ret);
+				return ret;
+			}
+		}
+	}
+
+	state->venc_channel = 0;
+	venc_fps = vcfg->video0.fps;
+	if (venc_fps == 0 || venc_fps > pconf.sensor_framerate)
+		venc_fps = pconf.sensor_framerate;
+	ret = star6e_pipeline_start_venc(pconf.image_width, pconf.image_height,
+		pconf.venc_max_rate, venc_fps, pconf.venc_gop_size,
+		pconf.rc_codec, pconf.rc_mode,
+		vcfg->video0.frame_lost, &state->venc_channel);
+	if (ret != 0)
+		return ret;
+
+	ret = bind_and_finalize_pipeline(state, vcfg, &pconf, sdk_quiet);
+	if (ret != 0) {
+		star6e_pipeline_stop_venc(state->venc_channel);
+		return ret;
+	}
+
+	return 0;
+}
 
 /* flatten: force GCC to inline all static callees into this function.
  * The SigmaStar I6E ISP driver depends on the monolithic stack layout

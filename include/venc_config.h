@@ -160,6 +160,14 @@ typedef struct {
 	uint32_t height;    /* 0 → inherit from main stream */
 } VencConfigSnapshot;
 
+typedef struct {
+	bool enabled;
+	char mode[16];          /* "lk" or "sad" */
+	bool show_osd;
+	bool verbose;
+	uint32_t fps;
+} VencConfigOptflow;
+
 /* ── Top-level config ────────────────────────────────────────────────── */
 
 typedef struct {
@@ -174,6 +182,7 @@ typedef struct {
 	VencConfigImu imu;
 	VencConfigRecord record;
 	VencConfigSnapshot snapshot;
+	VencConfigOptflow optflow;
 	VencConfigDebug debug;
 } VencConfig;
 

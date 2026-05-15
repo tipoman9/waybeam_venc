@@ -176,8 +176,24 @@ void venc_config_defaults(VencConfig *cfg)
 	cfg->snapshot.width   = 0;
 	cfg->snapshot.height  = 0;
 
+	/* optflow */
+	cfg->optflow.enabled = false;
+	safe_strcpy(cfg->optflow.mode, sizeof(cfg->optflow.mode), "lk");
+	cfg->optflow.show_osd = true;
+	cfg->optflow.verbose = false;
+	cfg->optflow.fps = 5;
+
 	/* debug */
 	cfg->debug.show_osd = false;
+}
+
+static void normalize_optflow_mode(VencConfigOptflow *s)
+{
+	if (strcmp(s->mode, "lk") == 0)
+		return;
+	if (strcmp(s->mode, "sad") == 0)
+		return;
+	safe_strcpy(s->mode, sizeof(s->mode), "lk");
 }
 
 /* ── Load from JSON file ─────────────────────────────────────────────── */
@@ -456,6 +472,21 @@ static void load_snapshot(const cJSON *root, VencConfigSnapshot *s)
 	s->height  = (uint32_t)json_get_int(obj, "height", (int)s->height);
 }
 
+static void load_optflow(const cJSON *root, VencConfigOptflow *s)
+{
+	const cJSON *obj = cJSON_GetObjectItemCaseSensitive(root, "optflow");
+	if (!obj) return;
+	s->enabled = json_get_bool(obj, "enabled", s->enabled);
+	safe_strcpy(s->mode, sizeof(s->mode),
+		json_get_string(obj, "mode", s->mode));
+	normalize_optflow_mode(s);
+	s->show_osd = json_get_bool(obj, "showOSD", s->show_osd);
+	s->verbose = json_get_bool(obj, "verbose", s->verbose);
+	s->fps = (uint32_t)json_get_int(obj, "fps", (int)s->fps);
+	if (s->fps < 1) s->fps = 1;
+	if (s->fps > 60) s->fps = 60;
+}
+
 static void load_fpv(const cJSON *root, VencConfigFpv *s)
 {
 	const cJSON *obj = cJSON_GetObjectItemCaseSensitive(root, "fpv");
@@ -513,6 +544,7 @@ int venc_config_load(const char *path, VencConfig *cfg)
 	load_imu(root, &cfg->imu);
 	load_record(root, &cfg->record);
 	load_snapshot(root, &cfg->snapshot);
+	load_optflow(root, &cfg->optflow);
 	{
 		const cJSON *obj = cJSON_GetObjectItemCaseSensitive(root, "debug");
 		if (obj)
@@ -1189,6 +1221,16 @@ static cJSON *config_to_cjson(const VencConfig *cfg)
 		cJSON_AddNumberToObject(snap, "channel", cfg->snapshot.channel);
 		cJSON_AddNumberToObject(snap, "width",   cfg->snapshot.width);
 		cJSON_AddNumberToObject(snap, "height",  cfg->snapshot.height);
+	}
+
+	/* optflow */
+	cJSON *optflow = cJSON_AddObjectToObject(root, "optflow");
+	if (optflow) {
+		cJSON_AddBoolToObject(optflow, "enabled", cfg->optflow.enabled);
+		cJSON_AddStringToObject(optflow, "mode", cfg->optflow.mode);
+		cJSON_AddBoolToObject(optflow, "showOSD", cfg->optflow.show_osd);
+		cJSON_AddBoolToObject(optflow, "verbose", cfg->optflow.verbose);
+		cJSON_AddNumberToObject(optflow, "fps", cfg->optflow.fps);
 	}
 
 	/* debug */
