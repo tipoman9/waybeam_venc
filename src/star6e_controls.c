@@ -295,6 +295,11 @@ static int apply_zoom(double pct, double x, double y)
 		pct, x, y);
 }
 
+static int apply_stab_locked(bool locked)
+{
+	return star6e_pipeline_apply_stab_locked(locked);
+}
+
 static int apply_qp_delta(int delta)
 {
 	MI_VENC_ChnAttr_t attr = {0};
@@ -1183,6 +1188,7 @@ static const VencApplyCallbacks g_star6e_apply_callbacks = {
 	.query_transport_status = query_transport_status,
 	.query_audio_status = query_audio_status,
 	.apply_zoom = apply_zoom,
+	.apply_stab_locked = apply_stab_locked,
 	.apply_isp_bin = apply_isp_bin,
 	.apply_snapshot_quality = venc_jpeg_set_quality,
 };

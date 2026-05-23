@@ -135,6 +135,12 @@ void star6e_pipeline_zoom_status(Star6eZoomStatus *out);
  *  the crop window. */
 int star6e_pipeline_stab_panel_anchor(int *out_x, int *out_y);
 
+/** Lock/unlock the stab offset.  When locked, all blit/crop paths apply
+ *  offset (0,0) so the image stays centred.  The accumulator continues
+ *  running — unlocking immediately resumes the stabilised offset.
+ *  Always returns 0.  Safe to call before or during pipeline run. */
+int star6e_pipeline_apply_stab_locked(bool locked);
+
 /** Service custom 3A (AWB/AE) at regular intervals. */
 /** One-shot legacy-AE cold-boot fps re-kick.  Call once ~1.5s after pipeline
  *  start from the run loop; re-issues MI_SNR_SetFps to force the sensor timing

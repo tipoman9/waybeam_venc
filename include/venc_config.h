@@ -163,6 +163,11 @@ typedef struct {
 	uint32_t stab_motion_thresh;  /* |inter-frame shift| (px) counted as
 	                               * "moving" — re-arms the stillness timer
 	                               * (0..16; higher = less twitchy). */
+	/* Runtime-only: NOT in waybeam.json, NOT parsed/serialised to JSON.
+	 * When true the stab thread applies offset (0,0) so the image stays
+	 * centred without stopping the pipeline.  Set/clear live via the HTTP
+	 * API (video0.stabLocked / video0.stab_locked). */
+	bool stab_locked;
 } VencConfigVideo;
 
 typedef struct {

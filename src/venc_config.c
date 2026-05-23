@@ -461,13 +461,19 @@ int venc_config_apply_framing_preset(const char *name, VencConfigVideo *v)
 	 *   preset       cropPct  tau   zoom_pct   effect
 	 *   ──────────────────────────────────────────────────────────────
 	 *   off          0        0     0.00       full image
-	 *   stab         80       180   0.00       image stabilization
+	 *   stab         80       180   0.00       image stabilization (crop)
+	 *   stab-fill    80       180   0.00       image stabilization (shift+fill)
 	 *   zoom-1.25x   0        0     0.80       1.25x digital zoom
 	 *   zoom-1.50x   0        0     0.6667     1.50x digital zoom
 	 *   zoom-1.75x   0        0     0.5714     1.75x digital zoom
 	 *   zoom-2x      0        0     0.50       2x digital zoom
 	 *   zoom-3x      0        0     0.3333     3x digital zoom
 	 *   zoom-4x      0        0     0.25       4x digital zoom
+	 *
+	 * stab-fill: same detector/accumulator as "stab" but outputs at full
+	 * source resolution — the frame is shifted and the exposed edge is filled
+	 * with black.  stabCropPct controls max shift: (100-pct)/2 % per axis.
+	 * Always uses the legacy blit path (no HW-crop); AE meters full frame.
 	 *
 	 * Approach-C zoom never upscales (crop dim == SCL output dim), so the
 	 * ch1 ~2x SCL upscale ceiling does NOT bound it; 3x/4x simply emit a
@@ -476,6 +482,7 @@ int venc_config_apply_framing_preset(const char *name, VencConfigVideo *v)
 	static const struct framing_preset table[] = {
 		{ "off",        0,  0,    0.0,    0,  0,  0,  0 },
 		{ "stab",       80, 180,  0.0,    30, 60, 88, 1 },
+		{ "stab-fill",  80, 180,  0.0,    30, 60, 88, 1 },
 		{ "zoom-1.25x", 0,  0,    0.80,   0,  0,  0,  0 },
 		{ "zoom-1.50x", 0,  0,    0.6667, 0,  0,  0,  0 },
 		{ "zoom-1.75x", 0,  0,    0.5714, 0,  0,  0,  0 },
@@ -590,7 +597,8 @@ static void load_video0(const cJSON *root, VencConfigVideo *v)
 		 * stand.  Otherwise a stale stabCropPct left over from a prior stab
 		 * session silently re-enables stabilization at framing=off, because
 		 * star6e_stab_enabled() keys solely on stab_crop_pct (>=50). */
-		if (strcmp(v->framing, "stab") == 0) {
+		if (strcmp(v->framing, "stab") == 0 ||
+		    strcmp(v->framing, "stab-fill") == 0) {
 			v->stab_crop_pct = (uint32_t)json_get_int(obj, "stabCropPct",
 				(int)v->stab_crop_pct);
 			v->stab_recenter_speed = (uint32_t)json_get_int(obj,

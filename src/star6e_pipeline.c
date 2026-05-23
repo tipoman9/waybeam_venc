@@ -836,6 +836,18 @@ static int g_stab_edge_pct = STAB_RECENTER_EDGE_PCT;
 static int g_stab_motion_thresh = STAB_MOTION_THRESH;
 static volatile int g_stab_off_x;
 static volatile int g_stab_off_y;
+/* Fill mode: 1 = shift-and-fill (full-res output + black margins),
+ * 0 = crop mode (smaller output, no fill).  Set by star6e_stab_configure(). */
+static volatile int g_stab_fill_mode;
+/* Lock flag: when non-zero the blit/crop functions use offset (0,0) so the
+ * image stays centred.  The accumulator continues running — unlocking
+ * immediately resumes the correct stabilised offset.  Written by
+ * star6e_pipeline_apply_stab_locked(); read on the stab thread. */
+static volatile int g_stab_locked;
+/* Precomputed per-axis max offset (pixels) in image domain.  Equals
+ * (src_w * (100 - crop_pct)) / 200 for both crop and fill modes. */
+static int g_stab_max_off_x;
+static int g_stab_max_off_y;
 /* User-controlled pan center as parts-per-thousand of (src_w, src_h).
  * 500/500 = exact center.  Updated live via star6e_stab_set_pan() so
  * the existing zoomX/zoomY HTTP controls steer the stabilized framing
@@ -946,13 +958,29 @@ static int star6e_stab_pan_clamp_mil(double v)
 static void star6e_stab_configure(uint32_t src_w, uint32_t src_h,
 	uint32_t crop_pct, uint32_t recenter_speed, uint32_t venc_fps,
 	double pan_x, double pan_y, uint32_t smooth_pct, uint32_t still_frames,
-	uint32_t edge_pct, uint32_t motion_thresh)
+	uint32_t edge_pct, uint32_t motion_thresh, int fill_mode)
 {
 	g_stab_src_w = src_w & ~1u;
 	g_stab_src_h = src_h & ~1u;
 	g_stab_crop_percent = crop_pct;
-	star6e_stab_compute_crop_dims(g_stab_src_w, g_stab_src_h,
-		crop_pct, &g_stab_enc_w, &g_stab_enc_h);
+	g_stab_fill_mode = fill_mode;
+
+	/* Precompute the per-axis max shift in image-domain pixels.  The formula
+	 * is identical for both modes: (src * (100 - pct)) / 200.  In crop mode
+	 * this equals (src_w - enc_w) / 2 algebraically, but the globals let
+	 * fill mode use a non-zero max_off while enc_w stays at src_w. */
+	g_stab_max_off_x = (int)((g_stab_src_w * (100u - crop_pct)) / 200u);
+	g_stab_max_off_y = (int)((g_stab_src_h * (100u - crop_pct)) / 200u);
+
+	if (fill_mode) {
+		/* Fill mode outputs full-resolution; enc dims stay at src dims so
+		 * port0 and the VENC channel are configured at the full size. */
+		g_stab_enc_w = g_stab_src_w & ~7u;
+		g_stab_enc_h = g_stab_src_h & ~1u;
+	} else {
+		star6e_stab_compute_crop_dims(g_stab_src_w, g_stab_src_h,
+			crop_pct, &g_stab_enc_w, &g_stab_enc_h);
+	}
 
 	/* Advanced feel knobs.  Each accepts a sentinel/out-of-range value and
 	 * falls back to the compile-time default, so a hand-edited config (which
@@ -1046,12 +1074,12 @@ int star6e_pipeline_stab_panel_anchor(int *out_x, int *out_y)
 
 static int star6e_stab_max_off_x(void)
 {
-	return (int)((g_stab_src_w - g_stab_enc_w) / 2u);
+	return g_stab_max_off_x;
 }
 
 static int star6e_stab_max_off_y(void)
 {
-	return (int)((g_stab_src_h - g_stab_enc_h) / 2u);
+	return g_stab_max_off_y;
 }
 
 /* Map an image-domain length to the VPE-input (precrop) domain.  When the
@@ -1323,6 +1351,7 @@ static int star6e_stab_send_frame_to_venc(const StabSysBufInfo_t *src_buf)
 	off_x = g_stab_off_x;
 	off_y = g_stab_off_y;
 	pthread_mutex_unlock(&g_stab_lock);
+	if (g_stab_locked) { off_x = 0; off_y = 0; }
 
 	/* User pan + stab shake-correction.  The crop window center is placed
 	 * at (pan_x, pan_y) parts-per-thousand of the source frame; the IVE
@@ -1350,6 +1379,185 @@ static int star6e_stab_send_frame_to_venc(const StabSysBufInfo_t *src_buf)
 	if (ret != 0) {
 		g_stab_sys_in_put_buf(venc_handle, &venc_buf, true);
 		return ret;
+	}
+
+	return g_stab_sys_in_put_buf(venc_handle, &venc_buf, false);
+}
+
+/* Shift-and-fill variant of star6e_stab_send_frame_to_venc.
+ *
+ * Outputs a full src_w×src_h frame — the source is shifted by the stabilizer
+ * accumulator offset and the exposed edge is filled with black (Y=0, UV=128).
+ *
+ * Geometry (off_x = g_stab_off_x from accumulator):
+ *   off_x > 0:  content from src_x=off_x placed at dst_x=0  → right black bar
+ *   off_x < 0:  content from src_x=0 placed at dst_x=-off_x → left black bar
+ * Same logic on Y.  blit_w = src_w - |off_x|, blit_h = src_h - |off_y|. */
+static int star6e_stab_send_shifted_frame_to_venc(const StabSysBufInfo_t *src_buf)
+{
+	StabSysBufConf_t conf;
+	StabSysBufInfo_t venc_buf;
+	StabSysBufHandle_t venc_handle = 0;
+	int off_x, off_y;
+	int src_x, src_y, dst_x, dst_y;
+	int blit_w, blit_h;
+	uint32_t stride_y, stride_uv;
+	uint8_t *y_vir, *uv_vir;
+	MI_S32 ret;
+
+	memset(&conf, 0, sizeof(conf));
+	conf.eBufType = STAB_E_BUFDATA_FRAME;
+	conf.u64TargetPts = star6e_stab_pts_us();
+	conf.stFrameCfg.eFormat = I6_PIXFMT_YUV420SP;
+	conf.stFrameCfg.eFrameScanMode = STAB_E_FRAME_SCAN_MODE_PROGRESSIVE;
+	conf.stFrameCfg.u16Width  = (MI_U16)g_stab_enc_w;   /* == src_w in fill mode */
+	conf.stFrameCfg.u16Height = (MI_U16)g_stab_enc_h;
+
+	memset(&venc_buf, 0, sizeof(venc_buf));
+	ret = g_stab_sys_in_get_buf(&g_stab_venc_port, &conf,
+		&venc_buf, &venc_handle, 20);
+	if (ret != 0)
+		return ret;
+
+	pthread_mutex_lock(&g_stab_lock);
+	off_x = g_stab_off_x;
+	off_y = g_stab_off_y;
+	pthread_mutex_unlock(&g_stab_lock);
+	if (g_stab_locked) { off_x = 0; off_y = 0; }
+
+	/* Clamp to max allowed shift. */
+	if (off_x >  g_stab_max_off_x) off_x =  g_stab_max_off_x;
+	if (off_x < -g_stab_max_off_x) off_x = -g_stab_max_off_x;
+	if (off_y >  g_stab_max_off_y) off_y =  g_stab_max_off_y;
+	if (off_y < -g_stab_max_off_y) off_y = -g_stab_max_off_y;
+	off_x &= ~1;
+	off_y &= ~1;
+
+	/* Source and destination offsets for the content blit. */
+	src_x  = (off_x > 0) ? off_x : 0;
+	src_y  = (off_y > 0) ? off_y : 0;
+	dst_x  = (off_x < 0) ? -off_x : 0;
+	dst_y  = (off_y < 0) ? -off_y : 0;
+	blit_w = ((int)g_stab_src_w - abs(off_x)) & ~1;
+	blit_h = ((int)g_stab_src_h - abs(off_y)) & ~1;
+
+	if (blit_w <= 0 || blit_h <= 0) {
+		g_stab_sys_in_put_buf(venc_handle, &venc_buf, true);
+		return -1;
+	}
+
+	/* Black fill via virtual address: Y=0 (black luma), UV=128 (neutral
+	 * chroma).  Required before the content blit so the unexposed margins
+	 * are zero-filled rather than whatever the buffer contained before.
+	 * Flush the CPU cache so the DMA engine sees the written values. */
+	stride_y  = venc_buf.stFrameData.u32Stride[0];
+	stride_uv = venc_buf.stFrameData.u32Stride[1] ?
+		venc_buf.stFrameData.u32Stride[1] : stride_y;
+	y_vir  = (uint8_t *)venc_buf.stFrameData.pVirAddr[0];
+	uv_vir = venc_buf.stFrameData.pVirAddr[1] ?
+		(uint8_t *)venc_buf.stFrameData.pVirAddr[1] :
+		y_vir + stride_y * g_stab_enc_h;
+
+	if (y_vir && uv_vir) {
+		memset(y_vir,  0,   stride_y  * g_stab_enc_h);
+		memset(uv_vir, 128, stride_uv * (g_stab_enc_h / 2u));
+		if (g_stab_sys_flush_inv_cache) {
+			g_stab_sys_flush_inv_cache(y_vir,  stride_y  * g_stab_enc_h);
+			g_stab_sys_flush_inv_cache(uv_vir, stride_uv * (g_stab_enc_h / 2u));
+		}
+	}
+
+	/* Blit the content with non-zero dst offset.  dst_y_frame dimensions
+	 * reflect the full buffer (enc == src in fill mode); dst rect carries
+	 * the placement offset so the hardware places the content correctly. */
+	{
+		StabSysFrameData_t *dst = &venc_buf.stFrameData;
+		const StabSysFrameData_t *src = &src_buf->stFrameData;
+		StabSysFrameData_t src_y_frame, dst_y_frame;
+		StabSysFrameData_t src_uv_frame, dst_uv_frame;
+		StabSysWindowRect_t src_y_rect, dst_y_rect;
+		StabSysWindowRect_t src_uv_rect, dst_uv_rect;
+		STAB_MI_PHY src_uv_pa, dst_uv_pa;
+		int src_y_stride  = (int)src->u32Stride[0];
+		int dst_y_stride  = (int)dst->u32Stride[0];
+		int src_uv_stride2 = src->u32Stride[1] ?
+			(int)src->u32Stride[1] : src_y_stride;
+		int dst_uv_stride2 = dst->u32Stride[1] ?
+			(int)dst->u32Stride[1] : dst_y_stride;
+
+		src_uv_pa = star6e_stab_uv_pa(src, g_stab_src_h);
+		dst_uv_pa = star6e_stab_uv_pa(dst, g_stab_enc_h);
+		if (!src_uv_pa || !dst_uv_pa) {
+			g_stab_sys_in_put_buf(venc_handle, &venc_buf, true);
+			return -1;
+		}
+
+		memset(&src_y_frame,  0, sizeof(src_y_frame));
+		memset(&dst_y_frame,  0, sizeof(dst_y_frame));
+		memset(&src_uv_frame, 0, sizeof(src_uv_frame));
+		memset(&dst_uv_frame, 0, sizeof(dst_uv_frame));
+		memset(&src_y_rect,   0, sizeof(src_y_rect));
+		memset(&dst_y_rect,   0, sizeof(dst_y_rect));
+		memset(&src_uv_rect,  0, sizeof(src_uv_rect));
+		memset(&dst_uv_rect,  0, sizeof(dst_uv_rect));
+
+		src_y_frame.ePixelFormat = STAB_E_PIXEL_FRAME_I8;
+		src_y_frame.phyAddr[0]   = src->phyAddr[0];
+		src_y_frame.u16Width     = (MI_U16)g_stab_src_w;
+		src_y_frame.u16Height    = (MI_U16)g_stab_src_h;
+		src_y_frame.u32Stride[0] = (MI_U32)src_y_stride;
+
+		dst_y_frame.ePixelFormat = STAB_E_PIXEL_FRAME_I8;
+		dst_y_frame.phyAddr[0]   = dst->phyAddr[0];
+		dst_y_frame.u16Width     = (MI_U16)g_stab_enc_w;
+		dst_y_frame.u16Height    = (MI_U16)g_stab_enc_h;
+		dst_y_frame.u32Stride[0] = (MI_U32)dst_y_stride;
+
+		src_y_rect.u16X      = (MI_U16)src_x;
+		src_y_rect.u16Y      = (MI_U16)src_y;
+		src_y_rect.u16Width  = (MI_U16)blit_w;
+		src_y_rect.u16Height = (MI_U16)blit_h;
+
+		dst_y_rect.u16X      = (MI_U16)dst_x;
+		dst_y_rect.u16Y      = (MI_U16)dst_y;
+		dst_y_rect.u16Width  = (MI_U16)blit_w;
+		dst_y_rect.u16Height = (MI_U16)blit_h;
+
+		ret = g_stab_sys_blit_pa(&dst_y_frame, &dst_y_rect,
+			&src_y_frame, &src_y_rect);
+		if (ret != 0) {
+			g_stab_sys_in_put_buf(venc_handle, &venc_buf, true);
+			return ret;
+		}
+
+		src_uv_frame.ePixelFormat = STAB_E_PIXEL_FRAME_I8;
+		src_uv_frame.phyAddr[0]   = src_uv_pa;
+		src_uv_frame.u16Width     = (MI_U16)g_stab_src_w;
+		src_uv_frame.u16Height    = (MI_U16)(g_stab_src_h / 2u);
+		src_uv_frame.u32Stride[0] = (MI_U32)src_uv_stride2;
+
+		dst_uv_frame.ePixelFormat = STAB_E_PIXEL_FRAME_I8;
+		dst_uv_frame.phyAddr[0]   = dst_uv_pa;
+		dst_uv_frame.u16Width     = (MI_U16)g_stab_enc_w;
+		dst_uv_frame.u16Height    = (MI_U16)(g_stab_enc_h / 2u);
+		dst_uv_frame.u32Stride[0] = (MI_U32)dst_uv_stride2;
+
+		src_uv_rect.u16X      = (MI_U16)src_x;
+		src_uv_rect.u16Y      = (MI_U16)(src_y / 2);
+		src_uv_rect.u16Width  = (MI_U16)blit_w;
+		src_uv_rect.u16Height = (MI_U16)(blit_h / 2);
+
+		dst_uv_rect.u16X      = (MI_U16)dst_x;
+		dst_uv_rect.u16Y      = (MI_U16)(dst_y / 2);
+		dst_uv_rect.u16Width  = (MI_U16)blit_w;
+		dst_uv_rect.u16Height = (MI_U16)(blit_h / 2);
+
+		ret = g_stab_sys_blit_pa(&dst_uv_frame, &dst_uv_rect,
+			&src_uv_frame, &src_uv_rect);
+		if (ret != 0) {
+			g_stab_sys_in_put_buf(venc_handle, &venc_buf, true);
+			return ret;
+		}
 	}
 
 	return g_stab_sys_in_put_buf(venc_handle, &venc_buf, false);
@@ -1666,10 +1874,18 @@ static void *star6e_stab_thread_main(void *arg)
 			}
 
 			/* Emit the new offset, then rotate prev to this frame.
-			 * HW mode: reprogram port0's hardware crop (VENC is fed by
-			 * the bind).  Legacy mode: BufBlitPa the crop into VENC. */
+			 * HW-crop mode: reprogram port0's hardware crop (VENC fed
+			 * by the bind).  Fill mode and legacy crop mode: BufBlitPa
+			 * into the VENC input buffer; fill mode zero-pads margins. */
 			if (g_stab_hw_mode) {
-				star6e_stab_apply_port_crop(acc_x, acc_y);
+				star6e_stab_apply_port_crop(
+					g_stab_locked ? 0 : acc_x,
+					g_stab_locked ? 0 : acc_y);
+			} else if (g_stab_fill_mode) {
+				ret = star6e_stab_send_shifted_frame_to_venc(&curr_buf);
+				if (ret != 0 && (dbg_frame % 60) == 0)
+					fprintf(stderr, "[waybeam] stab-fill venc send "
+						"failed ret=0x%x\n", ret);
 			} else {
 				ret = star6e_stab_send_frame_to_venc(&curr_buf);
 				if (ret != 0 && (dbg_frame % 60) == 0)
@@ -1687,7 +1903,10 @@ static void *star6e_stab_thread_main(void *arg)
 			 * re-output with the current accumulator.  Keep prev as the
 			 * last detected frame so the next detect spans the interval. */
 			if (!g_stab_hw_mode) {
-				ret = star6e_stab_send_frame_to_venc(&curr_buf);
+				if (g_stab_fill_mode)
+					ret = star6e_stab_send_shifted_frame_to_venc(&curr_buf);
+				else
+					ret = star6e_stab_send_frame_to_venc(&curr_buf);
 				if (ret != 0 && (dbg_frame % 60) == 0)
 					fprintf(stderr, "[waybeam] stab venc send failed "
 						"ret=0x%x\n", ret);
@@ -1798,6 +2017,22 @@ static int star6e_stab_setup_ports(Star6ePipelineState *state,
 		fprintf(stderr, "[waybeam] ERROR: stab port0 EnablePort failed "
 			"%d\n", (int)ret);
 		return ret;
+	}
+
+	/* Fill mode always uses the legacy blit path: port0 drains at full src
+	 * size (== enc size in fill mode) and the blit function places the
+	 * shifted content into the VENC input buffer with black fill margins.
+	 * Skip the port1 HW-crop attempt entirely. */
+	if (g_stab_fill_mode) {
+		ret = star6e_stab_reapply_vpe_port(g_stab_src_w, g_stab_src_h);
+		if (ret != 0)
+			return ret;
+		g_stab_vpe_port = vpe0;
+		g_stab_hw_mode = 0;
+		state->bound_vpe_venc = 0;
+		fprintf(stderr, "[waybeam] stab-fill: legacy blit mode "
+			"(full-res output, shift+fill)\n");
+		return 0;
 	}
 
 	/* port1: 256x256 centre detector tap — the BSP-dependent step. */
@@ -1983,6 +2218,12 @@ static int star6e_stab_enabled(const VencConfig *vcfg)
 {
 	return vcfg && vcfg->video0.stab_crop_pct >= 50 &&
 		vcfg->video0.stab_crop_pct <= 100;
+}
+
+static int star6e_stab_fill_enabled(const VencConfig *vcfg)
+{
+	return star6e_stab_enabled(vcfg) &&
+		strcmp(vcfg->video0.framing, "stab-fill") == 0;
 }
 
 /* Compute the effective output dim for digital zoom.
@@ -2419,6 +2660,12 @@ int star6e_pipeline_apply_zoom(Star6ePipelineState *state,
 	pthread_mutex_unlock(&g_pan_ramp.lock);
 
 	star6e_apply_ae_crop(pct, x, y);
+	return 0;
+}
+
+int star6e_pipeline_apply_stab_locked(bool locked)
+{
+	g_stab_locked = locked ? 1 : 0;
 	return 0;
 }
 
@@ -3374,10 +3621,10 @@ static int bind_and_finalize_pipeline(Star6ePipelineState *state,
 			state->bound_vif_vpe = 0;
 			return ret;
 		}
-		/* Seed the AE meter to the stabilized crop window.  The ISP-ready
-		 * wait above has already fired star6e_ae_crop_mark_ready(), so
-		 * this emits immediately rather than queueing. */
-		star6e_stab_apply_ae_crop();
+		/* Seed the AE meter to the stabilized crop window (crop mode only).
+		 * Fill mode outputs the full frame so AE meters the full sensor. */
+		if (!g_stab_fill_mode)
+			star6e_stab_apply_ae_crop();
 	} else {
 		bind_src_fps = state->sensor.mode.maxFps ?
 			state->sensor.mode.maxFps : pconf->sensor_framerate;
@@ -3828,11 +4075,16 @@ int star6e_pipeline_start(Star6ePipelineState *state, const VencConfig *vcfg,
 			vcfg->video0.stab_smooth_pct,
 			vcfg->video0.stab_still_frames,
 			vcfg->video0.stab_edge_pct,
-			vcfg->video0.stab_motion_thresh);
-		pconf.image_width = g_stab_enc_w;
-		pconf.image_height = g_stab_enc_h;
-		state->image_width = g_stab_enc_w;
-		state->image_height = g_stab_enc_h;
+			vcfg->video0.stab_motion_thresh,
+			star6e_stab_fill_enabled(vcfg));
+		/* Fill mode keeps the full source resolution as the encoded dim.
+		 * Crop mode shrinks to the crop window size. */
+		if (!g_stab_fill_mode) {
+			pconf.image_width = g_stab_enc_w;
+			pconf.image_height = g_stab_enc_h;
+			state->image_width = g_stab_enc_w;
+			state->image_height = g_stab_enc_h;
+		}
 	} else {
 		(void)star6e_pan_ramp_start(state, vcfg->video0.zoom_pct,
 			vcfg->video0.zoom_x, vcfg->video0.zoom_y);

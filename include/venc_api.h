@@ -76,6 +76,12 @@ typedef struct {
 	 * which dispatches to the per-backend venc_jpeg_backend_set_quality
 	 * hook (Get→modify→Set on the existing MJPEG channel). */
 	int (*apply_snapshot_quality)(uint32_t q);
+	/* Lock the stab offset to (0,0) so the image stays centred without
+	 * stopping the pipeline.  The stab thread keeps running (detector,
+	 * accumulator, recenter all active); when locked the blit/crop
+	 * functions apply offset (0,0) instead of the accumulated value.
+	 * Returns 0 on success.  NULL when the backend has no stab path. */
+	int (*apply_stab_locked)(bool locked);
 } VencApplyCallbacks;
 
 /* Register all API routes with the httpd.
