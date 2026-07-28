@@ -49,6 +49,12 @@ typedef struct {
   MI_SYS_ChnPort_t scl_port1;      /* SCL chn 0 port 1 — feeds MJPG snapshot VENC */
   MI_SYS_ChnPort_t venc_port;
   SensorSelectResult sensor;
+  /* encode_fps: video output fps (≤ sensor.fps).  sensor.fps is always
+   * the driver-native hw rate (mode maxFps from HMAX/VMAX); encode_fps
+   * is min(configured_fps, sensor.fps).  When encode_fps < sensor.fps
+   * the SDK drops the excess frames at the SCL output; VIF and the
+   * sensor run at sensor.fps throughout (majestic parity). */
+  uint32_t encode_fps;
   MarukoBackendConfig cfg;
   SceneDetector scene;
   struct DebugOsdState *debug_osd;  /* NULL if debug OSD disabled */

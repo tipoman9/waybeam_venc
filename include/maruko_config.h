@@ -70,6 +70,8 @@ typedef struct {
 	int verbose;
 	int connected_udp;
 	int keep_aspect;
+	int vif_crop;        /* diagnostic: VIF crops to output res before ISP */
+	int scl_direct_crop; /* diagnostic: SCL crops to output res, no scale */
 	int show_osd;
 	uint32_t ae_fps;        /* supervisory 3A rate (Hz); 0 disables */
 	uint32_t isp_gain_max;  /* sensor gain cap; 0 = use ISP bin default */

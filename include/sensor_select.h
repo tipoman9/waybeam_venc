@@ -57,7 +57,7 @@ struct SensorSelectResult {
 	MI_SNR_PadInfo_t pad;
 	MI_SNR_PlaneInfo_t plane;
 	MI_SNR_Res_t mode;
-	uint32_t fps;             /* actual fps set on the sensor */
+	uint32_t fps;             /* driver-native fps (mode maxFps from HMAX/VMAX) */
 	int mode_index;
 };
 

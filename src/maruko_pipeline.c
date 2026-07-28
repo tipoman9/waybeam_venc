@@ -45,6 +45,11 @@
 #include "rtp_session.h"
 #include "timing.h"
 
+/* ── Diagnostic: set to 1 to run VIF+ISP+SCL only with a null consumer.
+ * VENC is skipped entirely.  Check dmesg for ISP P0 FIFO FULL.
+ * If FULL appears → not VENC's fault.  If FULL disappears → VENC/buffer path. */
+#define MARUKO_TEST_SCL_DRAIN_ONLY 0
+
 static void idle_wait(RtpSidecarSender *sc, int timeout_ms)
 {
 	if (!sc || sc->fd < 0) {
@@ -72,6 +77,11 @@ static int g_mi_scl_chn_created = 0;
  * snapshot backend.  Configured + enabled in configure_maruko_scl, bound
  * to MJPG VENC dev 8 by venc_jpeg_backend_init (src/maruko_jpeg.c). */
 static int g_mi_scl_port1_enabled = 0;
+/* VIF dev group created (MI_VIF_CreateDevGroup called) but EnableDev /
+ * EnableOutputPort not necessarily run yet.  Tracked so teardown can call
+ * DestroyDevGroup even when configure_graph fails between create_vif_group
+ * and the full maruko_start_vif at the end. */
+static int g_vif_group_created = 0;
 
 static int maruko_config_dev_ring_pool(i6c_sys_mod module, MI_U32 device,
 	MI_U16 max_width, MI_U16 max_height, MI_U16 ring_line)
@@ -88,6 +98,8 @@ static int maruko_config_dev_ring_pool(i6c_sys_mod module, MI_U32 device,
 	pool.config.ring.maxWidth = max_width;
 	pool.config.ring.maxHeight = max_height;
 	pool.config.ring.ringLine = ring_line;
+	snprintf((char *)pool.config.ring.heapName,
+		sizeof(pool.config.ring.heapName), "mma_heap_name0");
 
 	MI_S32 ret = maruko_mi_sys_config_private_pool(0, &pool);
 	if (ret != 0) {
@@ -99,6 +111,34 @@ static int maruko_config_dev_ring_pool(i6c_sys_mod module, MI_U32 device,
 		printf("> [maruko] private ring pool configured"
 			" (module=%d dev=%u size=%ux%u ring=%u)\n",
 			module, device, max_width, max_height, ring_line);
+	}
+	return ret;
+}
+
+/* Configure the global VPE→VENC encoder ring pool (type=0).
+ * This is the transport ring for the SCL→VENC HW_RING bind path.
+ * Must be called before MI_VENC_CreateChn. */
+static int maruko_config_enc_ring_pool(MI_U32 size)
+{
+	if (size == 0)
+		return 0;
+
+	i6c_sys_pool pool;
+	memset(&pool, 0, sizeof(pool));
+	pool.type = I6C_SYS_POOL_ENCODER_RING;
+	pool.create = 1;
+	pool.config.encode.ringSize = size;
+	snprintf((char *)pool.config.encode.heapName,
+		sizeof(pool.config.encode.heapName), "mma_heap_name0");
+
+	MI_S32 ret = maruko_mi_sys_config_private_pool(0, &pool);
+	if (ret != 0) {
+		fprintf(stderr,
+			"WARNING: [maruko] encoder ring pool failed %d"
+			" (size=%u)\n", ret, size);
+	} else {
+		printf("> [maruko] encoder ring pool: size=%u ret=%d\n",
+			size, ret);
 	}
 	return ret;
 }
@@ -227,12 +267,21 @@ static int maruko_load_isp_bin(const char *isp_bin_path)
 					RTLD_DEFAULT,
 					"MI_ISP_IQ_ApiCmdLoadBinFile");
 				if (fn) {
-					/* DISABLED: IQ bin reload may reset
-					 * AE params from API bin load above.
-					 * Testing if this fixes dark image. */
-					printf("> [maruko] IQ bin load: "
-						"SKIPPED (testing AE fix)\n");
-					(void)fn;
+					/* IQ bin initializes the CMDQ-backed IQ
+					 * subsystem. Without this call, MI_ISP_IQ_Set*
+					 * writes are not queued to CMDQ → 3A_Proc_0
+					 * produces no CMDQ work → ISP CMDQ almost always
+					 * idle (Idle=616/618 vs majestic Idle=1/238).
+					 * This may cause the ISP to perform 2 DMA passes
+					 * per frame (DevISRCnt=2×VsyncCnt vs 1× in
+					 * majestic), halving effective throughput at
+					 * 2592×1944@45fps and causing FIFO FULL.
+					 * Note: this call may transiently reset AE params
+					 * written by MI_ISP_API_CmdLoadBinFile above;
+					 * cus3A converges within ~15 frames. */
+					int iq_ret = fn(0, 0, buf, (uint32_t)sz);
+					printf("> [maruko] IQ bin load: ret=%d\n",
+						iq_ret);
 				} else {
 					printf("> [maruko] IQ bin load: "
 						"symbol not found (skipped)\n");
@@ -335,13 +384,12 @@ void maruko_pipeline_install_signal_handlers(void)
 	sigaction(SIGHUP, &sa, NULL);
 }
 
-static int maruko_start_vif(const SensorSelectResult *sensor)
+/* Phase 1: register the VIF device group with MI_SYS.  This is sufficient
+ * for MI_SYS_BindChnPort2 (VIF→ISP) to succeed without starting any
+ * hardware.  EnableDev / EnableOutputPort run later in maruko_start_vif,
+ * after all downstream stages are configured and bound. */
+static int maruko_create_vif_group(const SensorSelectResult *sensor)
 {
-	MI_S32 ret = 0;
-	int group_created = 0;
-	int dev_enabled = 0;
-	int port_enabled = 0;
-
 	MI_VIF_GroupAttr_t group = {0};
 	group.eIntfMode = (MI_VIF_IntfMode_e)sensor->pad.intf;
 	group.eWorkMode = E_MI_VIF_WORK_MODE_1MULTIPLEX;
@@ -354,14 +402,33 @@ static int maruko_start_vif(const SensorSelectResult *sensor)
 		group.eClkEdge = E_MI_VIF_CLK_EDGE_DOUBLE;
 	}
 
-	ret = MI_VIF_CreateDevGroup(0, &group);
+	MI_S32 ret = MI_VIF_CreateDevGroup(0, &group);
 	if (ret != 0) {
 		fprintf(stderr,
 			"ERROR: [maruko] MI_VIF_CreateDevGroup failed %d\n",
 			ret);
 		return ret;
 	}
-	group_created = 1;
+	g_vif_group_created = 1;
+	return 0;
+}
+
+/* Phase 2: configure VIF hardware and enable the output port.  The sensor
+ * starts pushing MIPI frames into ISP immediately after EnableOutputPort.
+ * Must be called after maruko_create_vif_group and after all downstream
+ * stages (ISP, SCL, VENC, bindings) are fully configured and running.
+ *
+ * vif_crop_{x,y,w,h}: when w/h are non-zero and smaller than plane.capt,
+ * the VIF output port captures only that sub-window of the sensor active
+ * area (stCapRect), reducing ISP pixel load.  VIF sub-window crop is
+ * supported on I6C — majestic itself crops 2592×1944 → 2560×1920 at VIF.
+ * Pass w=0,h=0 to use the full sensor area (default). */
+static int maruko_start_vif(const SensorSelectResult *sensor,
+	uint32_t vif_crop_x, uint32_t vif_crop_y,
+	uint32_t vif_crop_w, uint32_t vif_crop_h)
+{
+	MI_S32 ret = 0;
+	int dev_enabled = 0;
 
 	MI_VIF_DevAttr_t dev = {0};
 	dev.stInputRect = sensor->plane.capt;
@@ -374,6 +441,20 @@ static int maruko_start_vif(const SensorSelectResult *sensor)
 			(I6_PIXFMT_RGB_BAYER +
 			 sensor->plane.precision * I6_BAYER_END +
 			 sensor->plane.bayer);
+	}
+
+	/* VIF sub-window crop: apply at the device level (stInputRect in
+	 * SetDevAttr) so the ISP only sees the cropped frame.  Port-level
+	 * stCapRect must always equal stInputRect — the SDK rejects any
+	 * mismatch with 0xA0009003 (test 10 failure).  Setting stInputRect
+	 * before SetDevAttr is the correct I6C path; majestic uses this
+	 * to capture 2560×1920 from a 2592×1944 sensor active area. */
+	if (vif_crop_w > 0 && vif_crop_h > 0 &&
+	    vif_crop_w < dev.stInputRect.width) {
+		dev.stInputRect.x      = (uint16_t)vif_crop_x;
+		dev.stInputRect.y      = (uint16_t)vif_crop_y;
+		dev.stInputRect.width  = (uint16_t)vif_crop_w;
+		dev.stInputRect.height = (uint16_t)vif_crop_h;
 	}
 
 	printf("> [maruko] VIF dev: inputRect(%u,%u %ux%u) pixel=%d\n",
@@ -395,9 +476,10 @@ static int maruko_start_vif(const SensorSelectResult *sensor)
 	}
 	dev_enabled = 1;
 
+	/* Port stCapRect must always equal dev.stInputRect (SDK invariant). */
 	MI_VIF_OutputPortAttr_t port = {0};
-	port.stCapRect = dev.stInputRect;
-	port.stDestSize.width = dev.stInputRect.width;
+	port.stCapRect        = dev.stInputRect;
+	port.stDestSize.width  = dev.stInputRect.width;
 	port.stDestSize.height = dev.stInputRect.height;
 	port.ePixFormat = dev.eInputPixel;
 	port.eFrameRate = E_MI_VIF_FRAMERATE_FULL;
@@ -424,17 +506,14 @@ static int maruko_start_vif(const SensorSelectResult *sensor)
 			ret);
 		goto fail;
 	}
-	port_enabled = 1;
 
 	return 0;
 
 fail:
-	if (port_enabled)
-		(void)MI_VIF_DisableOutputPort(0, 0);
 	if (dev_enabled)
 		(void)MI_VIF_DisableDev(0);
-	if (group_created)
-		(void)MI_VIF_DestroyDevGroup(0);
+	(void)MI_VIF_DestroyDevGroup(0);
+	g_vif_group_created = 0;
 	return ret;
 }
 
@@ -443,10 +522,11 @@ static void maruko_stop_vif(void)
 	(void)MI_VIF_DisableOutputPort(0, 0);
 	(void)MI_VIF_DisableDev(0);
 	(void)MI_VIF_DestroyDevGroup(0);
+	g_vif_group_created = 0;
 }
 
 static int configure_maruko_isp(const SensorSelectResult *sensor,
-	int vpe_level_3dnr)
+	int vpe_level_3dnr, uint32_t isp_in_w, uint32_t isp_in_h)
 {
 	MI_S32 ret = 0;
 	int dev = 0, chn = 0, started = 0, port = 0;
@@ -514,10 +594,15 @@ static int configure_maruko_isp(const SensorSelectResult *sensor,
 
 	i6c_isp_port isp_port;
 	memset(&isp_port, 0, sizeof(isp_port));
-	/* Match majestic: ISP output port uses YUV422_YUYV with zero crop
-	 * (let SCL handle crop/scale). Setting crop to sensor dimensions
-	 * caused ISP frame processing to stall at higher resolutions. */
-	isp_port.pixFmt = I6_PIXFMT_YUV422_YUYV;
+	/* ISP output port: YUV420SP to match majestic.
+	 * Crop must be set to full sensor capture size — majestic proc shows
+	 * PortCrop=(0,0,2592,1944). Leaving {0,0,0,0} may cause ISP FIFO FULL
+	 * because the driver cannot size its internal DMA descriptor properly. */
+	isp_port.crop.x = 0;
+	isp_port.crop.y = 0;
+	isp_port.crop.width  = isp_in_w;
+	isp_port.crop.height = isp_in_h;
+	isp_port.pixFmt = I6_PIXFMT_YUV420SP;
 	isp_port.compress = I6_COMPR_NONE;
 	printf("> [maruko] ISP port: crop(%u,%u %ux%u) fmt=%d compress=%d\n",
 		isp_port.crop.x, isp_port.crop.y,
@@ -611,8 +696,12 @@ static int configure_maruko_scl(const SensorSelectResult *sensor,
 	 * pipeline_common_compute_precrop() returns a centered rect that
 	 * matches the encode aspect ratio (zero offsets + full source dims
 	 * otherwise).  Writing it into scl_port.crop avoids non-uniform
-	 * scaling in the SCL stage.  Output = target dimensions; IFC
-	 * compress required for HW_RING binding to VENC. */
+	 * scaling in the SCL stage.  Output = target dimensions.
+	 * compress=0 (raw YUV420SP) for FRAMEBASE bind to H26x VENC.
+	 * RING+IFC limits VENC throughput to ~25fps on this SoC regardless
+	 * of SetInputSourceConfig value (RING_UNIFIED_DMA is the only mode
+	 * supported).  FRAMEBASE with compress=0 gives full 44fps.
+	 * MJPG snapshot port 1 also stays at compress=0 (raw). */
 	i6c_scl_port scl_port;
 	memset(&scl_port, 0, sizeof(scl_port));
 	if (precrop) {
@@ -624,7 +713,7 @@ static int configure_maruko_scl(const SensorSelectResult *sensor,
 	scl_port.output.width = (unsigned short)out_width;
 	scl_port.output.height = (unsigned short)out_height;
 	scl_port.pixFmt = I6_PIXFMT_YUV420SP;
-	scl_port.compress = (i6_common_compr)6; /* IFC */
+	scl_port.compress = 0; /* raw YUV420SP — FRAMEBASE bind to H26x VENC */
 	printf("> [maruko] SCL port: crop(%u,%u %ux%u) out(%ux%u) "
 		"fmt=%d compress=%d\n",
 		scl_port.crop.x, scl_port.crop.y,
@@ -713,11 +802,12 @@ fail:
 
 static int maruko_start_vpe(const SensorSelectResult *sensor,
 	uint32_t out_width, uint32_t out_height, int vpe_level_3dnr,
-	const PipelinePrecropRect *precrop)
+	const PipelinePrecropRect *precrop,
+	uint32_t vif_out_w, uint32_t vif_out_h)
 {
 	int isp_started = 0;
 
-	if (configure_maruko_isp(sensor, vpe_level_3dnr) != 0)
+	if (configure_maruko_isp(sensor, vpe_level_3dnr, vif_out_w, vif_out_h) != 0)
 		return -1;
 	isp_started = 1;
 
@@ -774,17 +864,17 @@ static void maruko_stop_vpe(void)
 }
 
 static void maruko_fill_h26x_attr(i6c_venc_attr_h26x *attr,
-	uint32_t width, uint32_t height)
+	uint32_t width, uint32_t height, int is_h265)
 {
 	attr->maxWidth = width;
 	attr->maxHeight = height;
-	attr->bufSize = width * height * 3 / 2;
-	attr->profile = 0;
+	attr->bufSize = width * height / 2;
+	attr->profile = is_h265 ? 1 : 0;
 	attr->byFrame = 1;
 	attr->width = width;
 	attr->height = height;
 	attr->bFrameNum = 0;
-	attr->refNum = 1;
+	attr->refNum = 0;
 }
 
 static void fill_maruko_rc_attr(i6c_venc_chn *attr,
@@ -1068,7 +1158,7 @@ int maruko_pipeline_apply_zoom(MarukoBackendContext *ctx,
 	scl_port.output.width = (unsigned short)ctx->cfg.image_width;
 	scl_port.output.height = (unsigned short)ctx->cfg.image_height;
 	scl_port.pixFmt = I6_PIXFMT_YUV420SP;
-	scl_port.compress = (i6_common_compr)6;  /* IFC */
+	scl_port.compress = 0; /* raw YUV420SP — FRAMEBASE bind to H26x VENC */
 
 	ret = g_mi_scl.fnSetPortConfig(0, 0, 0, &scl_port);
 	if (ret != 0) {
@@ -1204,37 +1294,28 @@ static int maruko_start_venc(const MarukoBackendConfig *cfg,
 	if (dev_created)
 		*dev_created = 0;
 
-	i6c_venc_init init = {
-		.maxWidth = 4096,
-		.maxHeight = 2176,
-	};
-	MI_S32 ret = maruko_mi_venc_create_dev(venc_dev, &init);
-	if (ret == 0) {
-		if (dev_created)
-			*dev_created = 1;
-	} else {
-		fprintf(stderr,
-			"WARNING: [maruko] MI_VENC_CreateDev failed %d"
-			" (continuing)\n", ret);
-	}
-
-	/* Ring pool MUST be configured before CreateChannel (matching
-	 * majestic i6c_hal.c order: pool → CreateChn → SetSource → Start) */
-	MI_U16 venc_ring = (MI_U16)height;
-	if (venc_ring == 0)
-		venc_ring = 1;
-	MI_S32 pool_ret = maruko_config_dev_ring_pool(I6C_SYS_MOD_VENC,
-		(MI_U32)venc_dev, (MI_U16)width, (MI_U16)height, venc_ring);
-	printf("> [maruko] VENC ring pool: %ux%u ring=%u ret=%d\n",
-		width, height, venc_ring, pool_ret);
+	/* Do NOT call MI_VENC_CreateDev here. Majestic skips it and the
+	 * kernel auto-creates the device (3840x2176) when CreateChn is
+	 * called. Calling CreateDev first sizes the HW ring DMA for
+	 * maxWidth=4096 strides; the subsequent ring pool config for the
+	 * actual encode width (e.g. 1920) then applies to a separate
+	 * allocation the device never uses, so VENC never consumes frames.
+	 *
+	 * No SetInputSourceConfig: VENC stays in default NORMAL mode.
+	 * Majestic (confirmed via proc dump) does NOT call SetInputSourceConfig.
+	 * Without a private SCL DEVICE_RING pool the kernel manages the ring
+	 * automatically; VENC consumes frames from it in NORMAL mode at full fps.
+	 * SetInputSourceConfig forces HW ring DMA mode which only achieves ~25fps
+	 * (kernel confirmed RING_UNIFIED_DMA for this platform). */
+	MI_S32 ret;
 
 	i6c_venc_chn attr = {0};
 	if (cfg->rc_codec == PT_H265) {
 		attr.attrib.codec = I6C_VENC_CODEC_H265;
-		maruko_fill_h26x_attr(&attr.attrib.h265, width, height);
+		maruko_fill_h26x_attr(&attr.attrib.h265, width, height, 1);
 	} else {
 		attr.attrib.codec = I6C_VENC_CODEC_H264;
-		maruko_fill_h26x_attr(&attr.attrib.h264, width, height);
+		maruko_fill_h26x_attr(&attr.attrib.h264, width, height, 0);
 	}
 
 	uint32_t gop = cfg->venc_gop_size;
@@ -1256,13 +1337,7 @@ static int maruko_start_venc(const MarukoBackendConfig *cfg,
 		return ret;
 	}
 
-	i6c_venc_src_conf input_mode = I6C_VENC_SRC_CONF_RING_DMA;
-	ret = maruko_mi_venc_set_input_source(venc_dev, *chn, &input_mode);
-	if (ret != 0) {
-		fprintf(stderr,
-			"WARNING: [maruko] MI_VENC_SetInputSourceConfig"
-			" failed %d\n", ret);
-	}
+	/* No SetInputSourceConfig — VENC stays in NORMAL mode (majestic parity). */
 
 	ret = maruko_mi_venc_start_recv(venc_dev, *chn);
 	if (ret != 0) {
@@ -1463,8 +1538,26 @@ static int setup_maruko_graph_dimensions(MarukoBackendContext *ctx)
 		return -1;
 	ctx->sensor_enabled = 1;
 
-	pipeline_common_report_selected_fps("[maruko] ", ctx->cfg.sensor_fps,
-		&ctx->sensor);
+	/* encode_fps: sensor.fps is the driver-native hw rate (majestic
+	 * parity — sensor always runs at mode maxFps from HMAX/VMAX).
+	 * encode_fps = min(configured, native); when encode_fps < sensor.fps
+	 * the SCL→VENC RING DstFrmrate drops the difference. */
+	{
+		uint32_t cfg_fps = ctx->cfg.sensor_fps ? ctx->cfg.sensor_fps
+		                                        : ctx->sensor.fps;
+		ctx->encode_fps = (cfg_fps > 0 && cfg_fps < ctx->sensor.fps)
+		                  ? cfg_fps : ctx->sensor.fps;
+		if (ctx->encode_fps == 0)
+			ctx->encode_fps = 30;
+		if (ctx->encode_fps != ctx->sensor.fps)
+			printf("> [maruko] VIF native %u fps, encode %u fps "
+				"(SCL drops %u f/s)\n",
+				ctx->sensor.fps, ctx->encode_fps,
+				ctx->sensor.fps - ctx->encode_fps);
+		else
+			printf("> [maruko] VIF native %u fps, encode %u fps\n",
+				ctx->sensor.fps, ctx->encode_fps);
+	}
 
 	/* Overscan detection: capture rect > crop rect can cause pipeline
 	 * hangs (e.g. binning modes report pre-binning capture).
@@ -1508,14 +1601,14 @@ static int setup_maruko_graph_dimensions(MarukoBackendContext *ctx)
 	ctx->cfg.image_width = out_w;
 	ctx->cfg.image_height = out_h;
 	ctx->cfg.venc_gop_size = pipeline_common_gop_frames(
-		ctx->cfg.venc_gop_seconds, ctx->sensor.fps);
+		ctx->cfg.venc_gop_seconds, ctx->encode_fps);
 
 	/* IntraRefresh auto-GOP override: when intraRefreshMode != off and the
 	 * user did not pin gopSize, align IDR period with one full GDR pass. */
 	{
 		IntraRefreshDerived ir;
 		IntraRefreshMode mode = maruko_intra_refresh_derive(
-			&ctx->cfg, ctx->cfg.image_height, ctx->sensor.fps,
+			&ctx->cfg, ctx->cfg.image_height, ctx->encode_fps,
 			ctx->cfg.rc_codec, &ir);
 		if (mode != INTRA_MODE_OFF && !ir.gop_overridden && ir.gop_frames > 0)
 			ctx->cfg.venc_gop_size = ir.gop_frames;
@@ -1524,23 +1617,20 @@ static int setup_maruko_graph_dimensions(MarukoBackendContext *ctx)
 	/* ISP throughput note: the Maruko ISP stalls when the sensor
 	 * pixel throughput exceeds ~144M pix/s.  Mode 3 (1472x816@120fps
 	 * = 144M) works; modes 0-2 (>=1920x1080) stall regardless of
-	 * FPS because the MIPI data rate is set by the sensor mode, not
-	 * the target FPS.  VIF sub-window crop is NOT supported on I6C.
-	 * To enable lower-FPS modes at 1080p, the sensor driver needs
-	 * custom mode entries with appropriate binning/MIPI settings. */
+	 * configured FPS because the MIPI data rate is fixed by the sensor
+	 * mode, not the target FPS.  VIF sub-window spatial crop IS
+	 * supported on I6C (majestic crops 2592×1944 → 2560×1920 at VIF);
+	 * vif_crop uses this to reduce per-frame ISP pixel load. */
 
-	/* Configure SCL ring pool using sensor capture dimensions.
-	 * Note: majestic skips this, but the SDK sample_venc.c uses it.
-	 * Use capture (ISP output) size, not effective/binned size. */
-	uint32_t capt_w = ctx->sensor.plane.capt.width;
-	uint32_t capt_h = ctx->sensor.plane.capt.height;
-	MI_U16 scl_ring = (MI_U16)(capt_h / 4);
-	if (scl_ring == 0)
-		scl_ring = 1;
-	MI_S32 pool_ret = maruko_config_dev_ring_pool(I6C_SYS_MOD_SCL, 0,
-		(MI_U16)capt_w, (MI_U16)capt_h, scl_ring);
-	printf("> [maruko] SCL ring pool: %ux%u ring=%u ret=%d\n",
-		capt_w, capt_h, scl_ring, pool_ret);
+	/* No private DEVICE_RING pool for SCL or VENC.
+	 * Majestic (confirmed via proc dump) does NOT configure any private
+	 * MMA ring pool.  The kernel manages the RING buffer automatically
+	 * when MI_SYS_BindChnPort2 is called with I6_SYS_LINK_RING.
+	 * Adding a DEVICE_RING pool forces HW ring DMA mode in the SCL driver,
+	 * which then requires SetInputSourceConfig in VENC — that path limits
+	 * throughput to ~25fps.  Without a pool, VENC consumes ring frames in
+	 * NORMAL mode at full sensor rate. */
+
 	printf("> [maruko] sensor capt: %ux%u  eff: %ux%u  out: %ux%u\n",
 		ctx->sensor.plane.capt.width, ctx->sensor.plane.capt.height,
 		eff_w, eff_h, out_w, out_h);
@@ -1573,13 +1663,95 @@ static void assign_maruko_ports(MarukoBackendContext *ctx,
 	};
 }
 
+#if MARUKO_TEST_SCL_DRAIN_ONLY
+/* Opaque buffer info struct — MI_SYS_BufInfo_t is ~256 B; 512 is safe. */
+typedef struct { char _raw[512]; } scl_buf_info_opaque_t;
+
+static volatile int     g_scl_drain_stop;
+static MI_SYS_ChnPort_t g_scl_drain_port;
+static pthread_t        g_scl_drain_tid;
+
+static void *scl_null_drain_fn(void *arg)
+{
+	(void)arg;
+	void *lib = dlopen("libmi_sys.so", RTLD_NOW | RTLD_NOLOAD);
+	if (!lib) lib = dlopen("libmi_sys.so", RTLD_NOW);
+	if (!lib) { fprintf(stderr, "[drain] dlopen: %s\n", dlerror()); return NULL; }
+
+	int (*fn_get)(MI_SYS_ChnPort_t *, scl_buf_info_opaque_t *, MI_S32 *) =
+		dlsym(lib, "MI_SYS_ChnOutputPortGetBuf");
+	int (*fn_put)(MI_S32) =
+		dlsym(lib, "MI_SYS_ChnOutputPortPutBuf");
+
+	if (!fn_get || !fn_put) {
+		fprintf(stderr, "[drain] dlsym failed: get=%p put=%p\n",
+			(void *)fn_get, (void *)fn_put);
+		return NULL;
+	}
+
+	uint32_t total = 0, per_sec = 0;
+	uint64_t last_print = wb_monotonic_us();
+
+	while (!g_scl_drain_stop) {
+		scl_buf_info_opaque_t info;
+		MI_S32 handle = -1;
+		if (fn_get(&g_scl_drain_port, &info, &handle) == 0 && handle >= 0) {
+			fn_put(handle);
+			total++;
+			per_sec++;
+		}
+		/* No sleep: spin-poll to minimize SCL buffer hold time.
+		 * This simulates an infinitely fast consumer for diagnostic. */
+		uint64_t now = wb_monotonic_us();
+		if (now - last_print >= 1000000ULL) {
+			printf("[drain] SCL frames/s: %u  total: %u\n", per_sec, total);
+			per_sec = 0;
+			last_print = now;
+		}
+	}
+	printf("[drain] stopped — total frames: %u\n", total);
+	return NULL;
+}
+
+static int bind_maruko_scl_drain_test(MarukoBackendContext *ctx)
+{
+	printf("> [maruko] *** SCL DRAIN TEST — no VENC, null consumer ***\n");
+	assign_maruko_ports(ctx, 0);   /* dummy venc_device=0 */
+
+	MI_S32 ret = MI_SYS_BindChnPort2(&ctx->vif_port, &ctx->isp_port,
+		ctx->sensor.fps, ctx->sensor.fps, I6_SYS_LINK_REALTIME, 0);
+	if (ret != 0) { fprintf(stderr, "ERROR: [drain] VIF->ISP %d\n", ret); return -1; }
+	ctx->bound_vif_vpe = 1;
+
+	ret = MI_SYS_BindChnPort2(&ctx->isp_port, &ctx->vpe_port,
+		ctx->sensor.fps, ctx->sensor.fps, I6_SYS_LINK_REALTIME, 0);
+	if (ret != 0) { fprintf(stderr, "ERROR: [drain] ISP->SCL %d\n", ret); return -1; }
+	ctx->bound_isp_vpe = 1;
+
+	/* usrDepth=1 enables userspace GetBuf on SCL port 0.
+	 * No bind to VENC — all frames go to userspace drain. */
+	(void)MI_SYS_SetChnOutputPortDepth(&ctx->vif_port, 0, 4);
+	(void)MI_SYS_SetChnOutputPortDepth(&ctx->isp_port, 0, 4);
+	(void)MI_SYS_SetChnOutputPortDepth(&ctx->vpe_port, 1, 4);
+
+	g_scl_drain_port = ctx->vpe_port;
+	g_scl_drain_stop = 0;
+	pthread_create(&g_scl_drain_tid, NULL, scl_null_drain_fn, NULL);
+	printf("> [drain] SCL drain thread started — watch dmesg for ISP P0 FIFO FULL\n");
+	return 0;
+}
+#endif /* MARUKO_TEST_SCL_DRAIN_ONLY */
+
 static int bind_maruko_pipeline(MarukoBackendContext *ctx)
 {
+#if MARUKO_TEST_SCL_DRAIN_ONLY
+	return bind_maruko_scl_drain_test(ctx);
+#endif
 	uint32_t out_w = ctx->cfg.image_width;
 	uint32_t out_h = ctx->cfg.image_height;
 
 	ctx->venc_device = 0;
-	if (maruko_start_venc(&ctx->cfg, out_w, out_h, ctx->sensor.fps,
+	if (maruko_start_venc(&ctx->cfg, out_w, out_h, ctx->encode_fps,
 	    ctx->venc_device, &ctx->venc_channel,
 	    &ctx->venc_dev_created) != 0)
 		return -1;
@@ -1606,8 +1778,14 @@ static int bind_maruko_pipeline(MarukoBackendContext *ctx)
 	}
 	ctx->bound_isp_vpe = 1;
 
+	/* SCL→VENC: FRAMEBASE bind with raw YUV420SP (compress=0).
+	 * RING+IFC was tried (tests 15-17+) but limits VENC to ~25fps due to
+	 * RING_UNIFIED_DMA throughput on this SoC.  FRAMEBASE with compress=0
+	 * gives full 44fps (confirmed test 12) and is sufficient for vifCrop=true.
+	 * For future full-res (vifCrop=false) a RING path is needed to decouple
+	 * SCL from VENC timing, but requires solving ISP DevISRCnt=2× first. */
 	ret = MI_SYS_BindChnPort2(&ctx->vpe_port, &ctx->venc_port,
-		ctx->sensor.fps, ctx->sensor.fps, I6_SYS_LINK_RING, 0);
+		ctx->sensor.fps, ctx->encode_fps, I6_SYS_LINK_FRAMEBASE, 0);
 	if (ret != 0) {
 		fprintf(stderr,
 			"ERROR: [maruko] bind SCL->VENC failed %d\n", ret);
@@ -1615,14 +1793,26 @@ static int bind_maruko_pipeline(MarukoBackendContext *ctx)
 	}
 	ctx->bound_vpe_venc = 1;
 
-	/* Set output port buffer depths to allow pipelining between
-	 * stages.  Without this, the pipeline has zero frame buffering
-	 * and any processing jitter causes frame drops, capping FPS
-	 * well below the sensor's output rate.
-	 * Star6E uses (1, 3) on the VENC port; SDK samples use (2, 4). */
-	(void)MI_SYS_SetChnOutputPortDepth(&ctx->isp_port, 1, 3);
-	(void)MI_SYS_SetChnOutputPortDepth(&ctx->vpe_port, 1, 3);
-	(void)MI_SYS_SetChnOutputPortDepth(&ctx->venc_port, 1, 3);
+	/* Set output port buffer depths to match majestic (verified from
+	 * /proc/mi_modules dumps while majestic runs at 45fps without FIFO FULL):
+	 *   VIF  port 0: usrDepth=0 → BufCntQuota=4  (ISP input queue: 4 slots)
+	 *   ISP  port 0: usrDepth=0 → BufCntQuota=4  (SCL input queue: 4 slots)
+	 *   SCL  port 0: usrDepth=0 → BufCntQuota=4  (VENC ring input: 4 slots)
+	 *   VENC port 0: usrDepth=0 → BufCntQuota=4  (ring tracking port)
+	 *   VENC port 1: usrDepth=2 → BufCntQuota=4  (encoded stream, app holds ≤2)
+	 * usrDepth=0 means no application code calls GetBuf on that port; all
+	 * slots remain in the driver pipeline.  usrDepth=1 on any of VIF/ISP/SCL
+	 * silently reduces BufCntQuota to 3 — at 45fps (22.2ms frame period) the
+	 * reduced ISP input queue depth causes ISP P0 FIFO FULL. */
+	(void)MI_SYS_SetChnOutputPortDepth(&ctx->vif_port, 0, 4);
+	(void)MI_SYS_SetChnOutputPortDepth(&ctx->isp_port, 0, 4);
+	(void)MI_SYS_SetChnOutputPortDepth(&ctx->vpe_port, 0, 4);
+	(void)MI_SYS_SetChnOutputPortDepth(&ctx->venc_port, 0, 4);
+	{
+		MI_SYS_ChnPort_t venc_stream = ctx->venc_port;
+		venc_stream.port = 1;
+		(void)MI_SYS_SetChnOutputPortDepth(&venc_stream, 2, 4);
+	}
 
 	/* JPEG snapshot backend on Maruko: dedicated MJPG VENC dev 8 chn 0
 	 * bound to SCL chn 0 port 1 in FRAMEBASE mode (see src/maruko_jpeg.c).
@@ -2063,10 +2253,10 @@ static void dual_fill_attr(i6c_venc_chn *attr,
 
 	if (base_cfg->rc_codec == PT_H265) {
 		attr->attrib.codec = I6C_VENC_CODEC_H265;
-		maruko_fill_h26x_attr(&attr->attrib.h265, width, height);
+		maruko_fill_h26x_attr(&attr->attrib.h265, width, height, 1);
 	} else {
 		attr->attrib.codec = I6C_VENC_CODEC_H264;
-		maruko_fill_h26x_attr(&attr->attrib.h264, width, height);
+		maruko_fill_h26x_attr(&attr->attrib.h264, width, height, 0);
 	}
 
 	uint32_t safe_gop = gop ? gop : 1;
@@ -2144,9 +2334,8 @@ int maruko_pipeline_start_dual(MarukoBackendContext *ctx,
 	}
 
 	/* CreateChn(dev, 1, &attr) — Phase 7 probe confirmed this works
-	 * after chn 0 is fully started.  Ring pool is per-dev and was
-	 * already provisioned for chn 0 in maruko_start_venc; no
-	 * second pool reservation is required for chn 1. */
+	 * after chn 0 is fully started.  No pool reservation is needed;
+	 * SCL→VENC uses RING+IFC (no ENCODER_RING pool, no SetInputSourceConfig). */
 	i6c_venc_chn attr = {0};
 	dual_fill_attr(&attr, &ctx->cfg, ctx->cfg.image_width,
 		ctx->cfg.image_height, bitrate, fps, gop_frames);
@@ -2157,7 +2346,7 @@ int maruko_pipeline_start_dual(MarukoBackendContext *ctx,
 			" failed %d\n", (int)dev, (int)chn, ret);
 		if (rebind_main) {
 			(void)MI_SYS_BindChnPort2(&ctx->vpe_port, &ctx->venc_port,
-				ctx->sensor.fps, ctx->sensor.fps,
+				ctx->sensor.fps, ctx->encode_fps,
 				I6_SYS_LINK_RING, 0);
 			ctx->bound_vpe_venc = 1;
 		}
@@ -2171,7 +2360,7 @@ int maruko_pipeline_start_dual(MarukoBackendContext *ctx,
 	 * the second encoder sees the same input frames.  Confirmed
 	 * empirically: binding SCL/0/0/0 -> VENC/0/1/0 directly returns
 	 * 0xA0092012 (SYS busy) because chn 0 already holds the SCL
-	 * output port in RING mode, and the SCL port cannot multi-consume.
+	 * output port, and the SCL port cannot multi-consume.
 	 *
 	 * The SDK sample does NOT call SetInputSourceConfig on chn 1 —
 	 * sub-channels default to NORMAL_FRMBASE (handshake by ~3-buffer
@@ -2188,7 +2377,7 @@ int maruko_pipeline_start_dual(MarukoBackendContext *ctx,
 		(void)maruko_mi_venc_destroy_chn(dev, chn);
 		if (rebind_main) {
 			(void)MI_SYS_BindChnPort2(&ctx->vpe_port, &ctx->venc_port,
-				ctx->sensor.fps, ctx->sensor.fps,
+				ctx->sensor.fps, ctx->encode_fps,
 				I6_SYS_LINK_RING, 0);
 			ctx->bound_vpe_venc = 1;
 		}
@@ -2201,7 +2390,7 @@ int maruko_pipeline_start_dual(MarukoBackendContext *ctx,
 	 * the encoder enters dual-channel mode correctly. */
 	if (rebind_main) {
 		ret = MI_SYS_BindChnPort2(&ctx->vpe_port, &ctx->venc_port,
-			ctx->sensor.fps, ctx->sensor.fps,
+			ctx->sensor.fps, ctx->encode_fps,
 			I6_SYS_LINK_RING, 0);
 		if (ret != 0) {
 			fprintf(stderr,
@@ -2361,8 +2550,47 @@ int maruko_pipeline_configure_graph(MarukoBackendContext *ctx)
 		scl_in_w = ctx->sensor.mode.output.width;
 		scl_in_h = ctx->sensor.mode.output.height;
 	}
+
+	/* VIF crop geometry (diagnostic test 1): center-crop sensor active
+	 * area to the encode output resolution before ISP, reducing per-frame
+	 * ISP pixel load.  vif_out_{w,h} is what ISP and SCL actually see. */
+	uint32_t vif_crop_x = 0, vif_crop_y = 0;
+	uint32_t vif_out_w = ctx->sensor.plane.capt.width;
+	uint32_t vif_out_h = ctx->sensor.plane.capt.height;
+	if (ctx->cfg.vif_crop && out_w > 0 && out_h > 0 &&
+	    out_w <= scl_in_w && out_h <= scl_in_h) {
+		vif_crop_x = ((scl_in_w - out_w) / 2) & ~1u;
+		vif_crop_y = ((scl_in_h - out_h) / 2) & ~1u;
+		vif_out_w  = out_w;
+		vif_out_h  = out_h;
+		/* SCL now receives out_w×out_h from ISP; no further crop or
+		 * scale is needed since ISP output already matches encode dims. */
+		scl_in_w = out_w;
+		scl_in_h = out_h;
+		printf("> [maruko] VIF crop: %ux%u -> %ux%u (offset %u,%u)\n",
+			ctx->sensor.plane.capt.width,
+			ctx->sensor.plane.capt.height,
+			out_w, out_h, vif_crop_x, vif_crop_y);
+	}
+
 	PipelinePrecropRect precrop = pipeline_common_compute_precrop(
 		scl_in_w, scl_in_h, out_w, out_h, ctx->cfg.keep_aspect ? true : false);
+
+	/* SCL direct-crop (diagnostic test 2): override the AR-preserving
+	 * precrop with a plain center crop from the full ISP output to the
+	 * exact encode resolution — no scaling.  VIF and ISP are unchanged
+	 * (full sensor frame).  Tests whether SCL scaling load, rather than
+	 * ISP processing, causes ISP P0 FIFO FULL. */
+	if (ctx->cfg.scl_direct_crop && !ctx->cfg.vif_crop &&
+	    out_w <= scl_in_w && out_h <= scl_in_h) {
+		precrop.x = (uint16_t)(((scl_in_w - out_w) / 2) & ~1u);
+		precrop.y = (uint16_t)(((scl_in_h - out_h) / 2) & ~1u);
+		precrop.w = (uint16_t)out_w;
+		precrop.h = (uint16_t)out_h;
+		printf("> [maruko] SCL direct crop: %ux%u -> %ux%u (offset %u,%u)\n",
+			scl_in_w, scl_in_h, out_w, out_h, precrop.x, precrop.y);
+	}
+
 	PipelinePrecropRect base_precrop = precrop;
 	if (ctx->cfg.verbose) {
 		if (precrop.x || precrop.y ||
@@ -2413,21 +2641,19 @@ int maruko_pipeline_configure_graph(MarukoBackendContext *ctx)
 	ctx->scl_crop_w = base_precrop.w;
 	ctx->scl_crop_h = base_precrop.h;
 
-	if (maruko_start_vif(&ctx->sensor) != 0)
-		return -1;
-	ctx->vif_started = 1;
-
+	/* Start ISP+SCL before VIF: once VIF's output port is enabled the
+	 * sensor begins pushing MIPI data into the ISP input FIFO.  At
+	 * 1188 Mbps (mode 3 / 60 fps) the FIFO fills fast enough to
+	 * trigger "ISP P0 FIFO FULL" if ISP isn't ready to drain it.
+	 * Correct SDK order: configure all downstream stages first (ISP,
+	 * SCL, VENC, bindings, CUS3A, audio, recorders), then enable VIF
+	 * last so data flows into a fully-ready pipeline immediately before
+	 * the frame loop starts.  VIF is started at the end of this
+	 * function after bind_maruko_pipeline completes. */
 	if (maruko_start_vpe(&ctx->sensor, out_w, out_h,
-	    ctx->cfg.vpe_level_3dnr, &precrop) != 0)
+	    ctx->cfg.vpe_level_3dnr, &precrop, vif_out_w, vif_out_h) != 0)
 		return -1;
 	ctx->vpe_started = 1;
-	if (ctx->cfg.zoom_pct > 0.0 && ctx->cfg.zoom_pct < 1.0) {
-		maruko_pipeline_set_zoom_status(ctx->cfg.zoom_pct,
-			out_w, out_h, precrop.x, precrop.y,
-			precrop.w, precrop.h);
-	} else {
-		maruko_pipeline_clear_zoom_status();
-	}
 
 	/* Debug OSD must initialise on the main thread BEFORE the VENC
 	 * kthread spawns: the kernel mi_rgn driver creates a singlethread
@@ -2479,6 +2705,14 @@ int maruko_pipeline_configure_graph(MarukoBackendContext *ctx)
 				"continuing without IMU\n");
 		}
 	}
+
+	/* Register VIF device group with MI_SYS before the bind.
+	 * MI_SYS_BindChnPort2 for VIF→ISP requires the VIF module to be
+	 * registered; CreateDevGroup does that without starting any hardware.
+	 * EnableDev / EnableOutputPort fire at the very end (maruko_start_vif)
+	 * once the full downstream pipeline is ready. */
+	if (maruko_create_vif_group(&ctx->sensor) != 0)
+		return -1;
 
 	if (bind_maruko_pipeline(ctx) != 0)
 		return -1;
@@ -2582,11 +2816,33 @@ int maruko_pipeline_configure_graph(MarukoBackendContext *ctx)
 		}
 	}
 
+	/* VIF last: sensor starts pushing frames now.  Everything downstream
+	 * (ISP, SCL, VENC, bindings, frame loop) is already fully configured
+	 * and StartRecvPic has been called, so the first frame lands in an
+	 * idle-but-ready pipeline.  Eliminates the startup ISP P0 FIFO FULL
+	 * caused by frames piling up in VENC before the loop starts. */
+	if (maruko_start_vif(&ctx->sensor,
+	    vif_crop_x, vif_crop_y, vif_out_w, vif_out_h) != 0)
+		return -1;
+	ctx->vif_started = 1;
+	if (ctx->cfg.zoom_pct > 0.0 && ctx->cfg.zoom_pct < 1.0) {
+		maruko_pipeline_set_zoom_status(ctx->cfg.zoom_pct,
+			out_w, out_h, precrop.x, precrop.y,
+			precrop.w, precrop.h);
+	} else {
+		maruko_pipeline_clear_zoom_status();
+	}
+
 	ctx->output_enabled = 1;
 	printf("> [maruko] pipeline configured\n");
-	printf("  - Sensor: %ux%u @ %u\n",
+	printf("  - Sensor: %ux%u @ %u fps (native VIF)\n",
 		ctx->sensor.mode.crop.width, ctx->sensor.mode.crop.height,
 		ctx->sensor.fps);
+	if (ctx->encode_fps != ctx->sensor.fps)
+		printf("  - Encode: %u fps (SCL frame drop from %u)\n",
+			ctx->encode_fps, ctx->sensor.fps);
+	else
+		printf("  - Encode: %u fps\n", ctx->encode_fps);
 	printf("  - Image : %ux%u\n",
 		ctx->cfg.image_width, ctx->cfg.image_height);
 	if (ctx->cfg.image_width != ctx->sensor.mode.crop.width ||
@@ -2658,8 +2914,8 @@ typedef struct {
 	uint64_t last_warn_us;
 } MarukoStreamRuntime;
 
-#define MARUKO_IDLE_ABORT_US ((uint64_t)20 * 1000000ULL)
-#define MARUKO_IDLE_WARN_US  ((uint64_t)1 * 1000000ULL)
+#define MARUKO_IDLE_ABORT_US  ((uint64_t)20 * 1000000ULL)
+#define MARUKO_IDLE_WARN_US   ((uint64_t)1  * 1000000ULL)
 #define MARUKO_PKTZR_VERBOSE_ACTIVE(ctx) ((ctx)->cfg.verbose && \
 	(ctx)->cfg.rc_codec == PT_H265 && \
 	(ctx)->cfg.stream_mode == MARUKO_STREAM_RTP)
@@ -2670,7 +2926,7 @@ static void maruko_pipeline_init_streaming(MarukoBackendContext *ctx,
 	memset(rt, 0, sizeof(*rt));
 	if (ctx->cfg.stream_mode == MARUKO_STREAM_RTP) {
 		maruko_video_init_rtp_state(&rt->rtp_state, ctx->cfg.rc_codec,
-			ctx->sensor.fps);
+			ctx->encode_fps);
 		rtp_sidecar_sender_init(&rt->sidecar, ctx->cfg.sidecar_port);
 	}
 	if (ctx->cfg.verbose) {
@@ -3073,6 +3329,15 @@ int maruko_pipeline_run(MarukoBackendContext *ctx)
 	MarukoStreamRuntime rt;
 	int result = -1;
 
+#if MARUKO_TEST_SCL_DRAIN_ONLY
+	(void)ctx;  /* suppress unused warning for other locals */
+	printf("> [drain-test] null drain running — press Ctrl+C to stop\n");
+	while (g_maruko_running) sleep(1);
+	g_scl_drain_stop = 1;
+	pthread_join(g_scl_drain_tid, NULL);
+	return 0;
+#endif
+
 	if (!ctx || (ctx->output.socket_handle < 0 && !ctx->output.ring))
 		return -1;
 
@@ -3196,13 +3461,17 @@ void maruko_pipeline_teardown_graph(MarukoBackendContext *ctx)
 		ctx->venc_started = 0;
 		ctx->venc_dev_created = 0;
 	}
+	/* Stop VIF before VPE — mirror of init order (VPE first, VIF last)
+	 * so the data source is shut down before the processor.
+	 * Also clean up when the group was created but configure_graph
+	 * failed before the full maruko_start_vif could run. */
+	if (ctx->vif_started || g_vif_group_created) {
+		maruko_stop_vif();
+		ctx->vif_started = 0;
+	}
 	if (ctx->vpe_started) {
 		maruko_stop_vpe_channels();
 		ctx->vpe_started = 0;
-	}
-	if (ctx->vif_started) {
-		maruko_stop_vif();
-		ctx->vif_started = 0;
 	}
 	if (ctx->sensor_enabled) {
 		(void)MI_SNR_Disable(ctx->sensor.pad_id);

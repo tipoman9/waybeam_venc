@@ -250,7 +250,9 @@ static void load_isp(const cJSON *root, VencConfigIsp *s)
 	safe_strcpy(s->awb_mode, sizeof(s->awb_mode),
 		json_get_string(obj, "awbMode", s->awb_mode));
 	s->awb_ct = (uint32_t)json_get_int(obj, "awbCt", (int)s->awb_ct);
-	s->keep_aspect = json_get_bool(obj, "keepAspect", s->keep_aspect);
+	s->keep_aspect     = json_get_bool(obj, "keepAspect",     s->keep_aspect);
+	s->vif_crop        = json_get_bool(obj, "vifCrop",        s->vif_crop);
+	s->scl_direct_crop = json_get_bool(obj, "sclDirectCrop",  s->scl_direct_crop);
 }
 
 static void load_image(const cJSON *root, VencConfigImage *s)
@@ -882,7 +884,9 @@ static void render_isp(PrettyBuf *p, const VencConfig *cfg, int is_last)
 	pp_field_uint(p,   2, "gainMax",    cfg->isp.gain_max,    0);
 	pp_field_string(p, 2, "awbMode",    cfg->isp.awb_mode,    0);
 	pp_field_uint(p,   2, "awbCt",      cfg->isp.awb_ct,      0);
-	pp_field_bool(p,   2, "keepAspect", cfg->isp.keep_aspect, 1);
+	pp_field_bool(p,   2, "keepAspect",    cfg->isp.keep_aspect,    0);
+	pp_field_bool(p,   2, "vifCrop",       cfg->isp.vif_crop,       0);
+	pp_field_bool(p,   2, "sclDirectCrop", cfg->isp.scl_direct_crop, 1);
 	pp_section_close(p, 1, is_last);
 }
 
@@ -1077,7 +1081,9 @@ static cJSON *config_to_cjson(const VencConfig *cfg)
 		cJSON_AddNumberToObject(isp, "gainMax", cfg->isp.gain_max);
 		cJSON_AddStringToObject(isp, "awbMode", cfg->isp.awb_mode);
 		cJSON_AddNumberToObject(isp, "awbCt", cfg->isp.awb_ct);
-		cJSON_AddBoolToObject(isp, "keepAspect", cfg->isp.keep_aspect);
+		cJSON_AddBoolToObject(isp, "keepAspect",    cfg->isp.keep_aspect);
+		cJSON_AddBoolToObject(isp, "vifCrop",       cfg->isp.vif_crop);
+		cJSON_AddBoolToObject(isp, "sclDirectCrop", cfg->isp.scl_direct_crop);
 	}
 
 	/* image */

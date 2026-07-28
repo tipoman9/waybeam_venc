@@ -358,35 +358,53 @@ static int set_sensor_fps(MI_SNR_PAD_ID_e pad, MI_U32 mode_index,
 	const MI_SNR_Res_t *mode, uint32_t target_fps,
 	const SensorStrategy *strategy, SensorSelectResult *result)
 {
-	uint32_t requested_fps = target_fps ? target_fps : 30;
-	uint32_t clamped = sensor_mode_clamp_fps(mode, requested_fps);
+	/* Majestic parity: prefer running the sensor at its driver-native fps
+	 * (mode->maxFps, from HMAX/VMAX in the init table) so VIF shows the
+	 * true hw rate; frame-rate reduction to target_fps is done downstream
+	 * via the SCL→VENC RING DstFrmrate.
+	 *
+	 * Exception — large overruns: when native_fps >> target_fps (more
+	 * than ~5 fps overhead), running at native rate reduces inter-frame
+	 * blanking too much for the ISP to recover, causing ISP FIFO FULL.
+	 * In that case fall back to target_fps so the sensor generates more
+	 * blanking lines per frame.  Example: mode 3 at 1188 Mbps (native
+	 * 60 fps) configured for 42 fps — SetFPS(42) sets VMAX higher, giving
+	 * ~7 ms of extra blanking that lets the ISP drain the FIFO. */
+	uint32_t native_fps = mode->maxFps ? mode->maxFps : 30;
+	/* Use native fps (mode->maxFps) for majestic parity unless the gap
+	 * is large enough that running at native rate would starve the ISP
+	 * of blanking time.  Threshold ≥10 fps chosen so:
+	 *   mode2 native=45, cfg=38 (diff=7)  → native  (VIF=45, vid=38) ✓
+	 *   mode3 native=60, cfg=42 (diff=18) → configured (avoid FIFO FULL) ✓ */
+	uint32_t hw_fps = (target_fps > 0 && native_fps >= target_fps + 10)
+	                  ? sensor_mode_clamp_fps(mode, target_fps)
+	                  : native_fps;
 	result->fps = 0;
 
-	MI_S32 err = sensor_try_set_fps(pad, mode_index, clamped, strategy);
+	MI_S32 err = sensor_try_set_fps(pad, mode_index, hw_fps, strategy);
 	if (err == 0) {
-		result->fps = clamped;
+		result->fps = hw_fps;
 		return 0;
 	}
 
-	printf("> Requested %u fps (clamped %u) failed with %d; trying safe fallback\n",
-		requested_fps, clamped, err);
+	printf("> Sensor fps %u failed %d; trying 30 fps fallback\n",
+		hw_fps, err);
 
 	uint32_t fallback = sensor_mode_clamp_fps(mode, 30);
-	if (fallback != 0 && fallback != clamped &&
+	if (fallback != 0 && fallback != hw_fps &&
 		sensor_mode_fps_supported(mode, fallback)) {
 		err = sensor_try_set_fps(pad, mode_index, fallback, strategy);
 		if (err == 0) {
 			result->fps = fallback;
-			printf("> Requested %u fps, sensor accepted %u fps "
-				"(mode min %u max %u)\n",
-				requested_fps, fallback, mode->minFps, mode->maxFps);
+			printf("> Sensor accepted %u fps (wanted %u, mode min %u max %u)\n",
+				fallback, hw_fps, mode->minFps, mode->maxFps);
 			return 0;
 		}
 	}
 
-	fprintf(stderr, "ERROR: MI_SNR_SetFps(pad %d) failed for requested %u fps "
-		"(last err %d, mode min %u max %u)\n",
-		pad, requested_fps, err, mode->minFps, mode->maxFps);
+	fprintf(stderr, "ERROR: MI_SNR_SetFps(pad %d) failed for %u fps "
+		"(target %u, native %u, last err %d, mode min %u max %u)\n",
+		pad, hw_fps, target_fps, native_fps, err, mode->minFps, mode->maxFps);
 	return err ? err : -1;
 }
 

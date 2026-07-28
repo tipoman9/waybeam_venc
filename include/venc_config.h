@@ -59,6 +59,16 @@ typedef struct {
 	                        * downstream and stretch.  Star6E applies the
 	                        * crop at VIF; Maruko applies it at the SCL
 	                        * port.crop. */
+	bool vif_crop;         /* Maruko diagnostic: VIF center-crops sensor to
+	                        * exact output resolution before ISP.  ISP and
+	                        * SCL see only the output-sized frame; no SCL
+	                        * scaling.  Tests whether ISP throughput is the
+	                        * bottleneck causing ISP P0 FIFO FULL. */
+	bool scl_direct_crop;  /* Maruko diagnostic: SCL center-crops full ISP
+	                        * output to exact output resolution with no
+	                        * scaling.  VIF/ISP unchanged (full sensor frame).
+	                        * Tests whether SCL scaling load (not ISP) causes
+	                        * ISP P0 FIFO FULL. */
 } VencConfigIsp;
 
 typedef struct {

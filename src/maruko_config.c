@@ -33,10 +33,12 @@ void maruko_config_defaults(MarukoBackendConfig *cfg)
 	cfg->forced_sensor_pad = (MI_SNR_PAD_ID_e)-1;
 	cfg->forced_sensor_mode = -1;
 	cfg->isp_bin_path[0] = '\0';
-	cfg->vpe_level_3dnr = 1;
+	cfg->vpe_level_3dnr = 0;
 	cfg->verbose = 0;
 	cfg->connected_udp = 1;  /* match VencConfig default */
-	cfg->keep_aspect = 1;    /* match VencConfig default (true) */
+	cfg->keep_aspect     = 1;   /* match VencConfig default (true) */
+	cfg->vif_crop        = 0;
+	cfg->scl_direct_crop = 0;
 	cfg->show_osd = 0;
 	cfg->ae_fps = 15;
 	cfg->isp_gain_max = 0;
@@ -125,7 +127,9 @@ int maruko_config_from_venc(const VencConfig *vcfg, MarukoBackendConfig *cfg)
 	cfg->zoom_y   = vcfg->video0.zoom_y;
 	cfg->verbose = vcfg->system.verbose ? 1 : 0;
 	cfg->connected_udp = vcfg->outgoing.connected_udp ? 1 : 0;
-	cfg->keep_aspect = vcfg->isp.keep_aspect ? 1 : 0;
+	cfg->keep_aspect     = vcfg->isp.keep_aspect ? 1 : 0;
+	cfg->vif_crop        = vcfg->isp.vif_crop ? 1 : 0;
+	cfg->scl_direct_crop = vcfg->isp.scl_direct_crop ? 1 : 0;
 	cfg->show_osd = vcfg->debug.show_osd ? 1 : 0;
 	cfg->ae_fps = vcfg->isp.ae_fps;
 	cfg->isp_gain_max = vcfg->isp.gain_max;
