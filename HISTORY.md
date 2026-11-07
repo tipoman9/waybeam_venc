@@ -1,5 +1,23 @@
 # History
 
+## [0.84.1] - 2026-11-07
+
+Phase A of optical flow on Hi3516CV610: measure before porting.
+
+- **`tools/cv610_ive_bench.c`** (`make cv610-ive-bench SOC_BUILD=cv610`) times
+  the IVE operators an optical-flow port would run on — `st_cand_corner` +
+  `st_corner`, pyramid build by `resize` and by DMA decimation, pyramidal LK
+  at 50/100/500 points and every legal `max_level`, and the whole per-solve
+  chain — on synthetic frames with a known shift, so each run also reports
+  tracking accuracy and which LK status value means "tracked". DEV-ONLY; not
+  staged.
+- **`init.d/load-cv610-online` loads `open_ive save_power=1`**, non-fatal, and
+  unloads it in the stop list. Video does not depend on it.
+- **`documentation/CV610_OPTICAL_FLOW.md`** records why the Star6E `OptFlow`
+  branch is re-implemented rather than merged (its LK path is mostly CPU, its
+  SAD path entirely so, and it has no measurements), what the CV610 IVE
+  offers, the benchmark's go/no-go rule, and the Phase B outline.
+
 ## [0.84.0] - 2026-09-06
 
 `record.format="hevc"` now rotates, and **neither recorder forces a keyframe

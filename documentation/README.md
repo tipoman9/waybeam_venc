@@ -9,6 +9,10 @@ This folder is the canonical place for waybeam_venc project documentation.
 - `documentation/CV610_RESILIENCE_SLICES_PLAN.md`
   - Approved phased plan and device gates for CV610 resilience, ref prediction,
     frame metadata and whole-access-unit H.265 slicing.
+- `documentation/CV610_OPTICAL_FLOW.md`
+  - Optical flow on Hi3516CV610: what the IVE offers, the Phase A benchmark
+    (`tools/cv610_ive_bench.c`) and its go/no-go rule, and the Phase B port
+    outline.
 - `documentation/DUAL_BACKEND_SPLIT_PLAN.md`
   - Current architecture/implementation plan for Star6E + Maruko targeted builds.
   - Tracks only remaining implementation steps from the current stable baseline.

@@ -234,6 +234,10 @@ and continues on the boot-time clock.
    audio gain/mute only after the analog control path can be operator-verified.
 5. Independent snapshot geometry (`snapshot.width`/`height`), which needs a
    dedicated VPSS scaler channel running continuously.
+6. Optical flow on the IVE (pyramidal LK + Shi-Tomasi corners). In
+   measurement: `make cv610-ive-bench` and `documentation/CV610_OPTICAL_FLOW.md`
+   hold the benchmark and the decision rule; the loader now brings up
+   `open_ive` (non-fatal) so the tool can run.
 
 Unsupported SigmaStar-only fields remain in the common configuration schema
 but are marked unsupported in `/api/v1/capabilities` and rejected before

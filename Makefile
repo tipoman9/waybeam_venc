@@ -190,7 +190,8 @@ LDFLAGS += $(COMMON_LDFLAGS) $(SOC_LDFLAGS)
         drivers-maruko ksrc-star6e drivers-star6e maruko-pull maruko-deploy maruko-full json_cli regscan \
         remote-test verify pre-pr \
         check check-soc-stamp print-config test test-werror test-asan test-tsan test-ci \
-        qr-decode unix-dgram-consumer qr-test-host qr-test-cli qr-test-extended qr-test-phone webui webui-check
+        qr-decode unix-dgram-consumer qr-test-host qr-test-cli qr-test-extended qr-test-phone webui webui-check \
+        cv610-ive-bench cv610-ive-sdk
 
 help:
 	@echo "Targets:"
@@ -214,6 +215,7 @@ help:
 	@echo "  make toolchain-cv610 Ensure CV610 cross-toolchain is present"
 	@echo "  make cv610-sdk Validate the external CV610 compiler, headers, and libraries"
 	@echo "  make sensor-cv610 Build the CV610 IMX662 userspace sensor plugin"
+	@echo "  make cv610-ive-bench SOC_BUILD=cv610  Build out/cv610/cv610_ive_bench (IVE corners/pyramid/LK timing)"
 	@echo "  make ksrc-maruko KSRC_MARUKO=/path/to/kernel  Validate Infinity6C kernel source tree"
 	@echo "  make drivers-maruko KSRC_MARUKO=/path/to/kernel  Build sensors/maruko/sensor_imx*_maruko.ko"
 	@echo "  make ksrc-star6e KSRC_STAR6E=/path/to/kernel  Validate Infinity6E 4.9.84 kernel source tree"
@@ -336,6 +338,32 @@ ipu-probe: $(IPU_PROBE_TARGET)
 $(IPU_PROBE_TARGET): $(IPU_PROBE_SRC) include/star6e_ipu.h include/detect_dequant.h
 	@mkdir -p $(@D)
 	$(CC) -Os -s -Wall -Wextra -std=c99 -D_GNU_SOURCE -Iinclude $(IPU_PROBE_SRC) -ldl -o $@
+
+# cv610_ive_bench — Hi3516CV610 IVE operator benchmark: Shi-Tomasi corners,
+# pyramid build (resize vs DMA decimation) and pyramidal LK on synthetic
+# shifted frames.  DEV-ONLY, cross-compiled for the target; not part of the
+# shipped binary.  Phase A of the optical-flow port, see
+# documentation/CV610_OPTICAL_FLOW.md.  Needs SOC_BUILD=cv610 for the SDK
+# include paths, and libss_mpi_ive.so, which the daemon does not link yet —
+# hence its own SDK check rather than a stricter cv610-sdk for everyone.
+CV610_IVE_BENCH_TARGET := $(OUT_DIR)/cv610_ive_bench
+CV610_IVE_BENCH_SRC    := tools/cv610_ive_bench.c
+cv610-ive-bench: cv610-ive-sdk | $(OUT_DIR)
+cv610-ive-bench: $(CV610_IVE_BENCH_TARGET)
+
+cv610-ive-sdk: cv610-sdk
+	@test "$(SOC_BUILD)" = cv610 || { \
+		echo "ERROR: cv610-ive-bench needs SOC_BUILD=cv610" >&2; exit 1; }
+	@test -f "$(CV610_SDK_INC)/kernel/include/hi3516cv6xx/ss_mpi_ive.h" || { \
+		echo "ERROR: ss_mpi_ive.h not found under $(CV610_SDK_INC)" >&2; exit 1; }
+	@test -f "$(CV610_SDK_LIB)/libss_mpi_ive.so" || { \
+		echo "ERROR: libss_mpi_ive.so not found under $(CV610_SDK_LIB)" >&2; exit 1; }
+
+$(CV610_IVE_BENCH_TARGET): $(CV610_IVE_BENCH_SRC)
+	@mkdir -p $(@D)
+	$(CV610_CC) -Os -s -Wall -Wextra -Werror -std=c99 -D_GNU_SOURCE $(SOC_CFLAGS) \
+		-L$(CV610_SDK_LIB) $(SOC_LDFLAGS) $< \
+		-lss_mpi_ive -lss_mpi -lss_mpi_sysmem -lss_mpi_sysbind -lsecurec -lot_osal -lm -o $@
 
 # qr_decode — isolated QR decoder for the Star6E scan-window worker and for
 # scripts which fetch GET /api/v1/snapshot.jpg. It accepts JPEG or P5 PGM;

@@ -171,6 +171,17 @@ start_modules()
 	# strength of the module name is the guess this file warns against
 	# above, and it would have named a device that can never be held.
 
+	# IVE (Intelligent Video Engine): the hardware corner detector, pyramid
+	# builder and pyramidal LK that the optical-flow port runs on
+	# (documentation/CV610_OPTICAL_FLOW.md).  Depends on osal/base/mmz only.
+	# save_power=1 is what stock OpenIPC passes.  Deliberately NOT fatal:
+	# video does not depend on it, a firmware without open_ive.ko simply has
+	# no optical flow.  Not in MPP_DEVICES until its /dev node is confirmed on
+	# the target the way that list demands (ls -l /dev before and after).
+	if ! load_stock open_ive save_power=1; then
+		echo "warning: open_ive not loaded; optical flow unavailable" >&2
+	fi
+
 	# AI capture only: open_ao/open_adec are playback-side and stay out.
 	# open_acodec drives the analog front end and must come after open_aio.
 	if [ "$AUDIO" = "1" ]; then
@@ -201,7 +212,7 @@ stop_modules()
 	fi
 	modules="open_user open_mipi_rx open_sensor_i2c \
 		open_acodec open_aenc open_ai open_aio \
-		open_jpege open_h265e open_venc open_rc open_chnl open_isp open_vi \
+		open_ive open_jpege open_h265e open_venc open_rc open_chnl open_isp open_vi \
 		open_vpss open_vgs open_vpp open_rgn open_sys open_vca open_vb \
 		open_pm_stub open_base open_mmz open_osal open_sys_config"
 	rc=0
